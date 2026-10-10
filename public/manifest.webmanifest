@@ -1,0 +1,9 @@
+{
+  "name": "Wayfarer Outing Companion",
+  "short_name": "Wayfarer",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f7f6f1",
+  "theme_color": "#f7f6f1",
+  "icons": []
+}
