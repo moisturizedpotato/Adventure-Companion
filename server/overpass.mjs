@@ -1,17 +1,20 @@
 import { setTimeout as delay } from "node:timers/promises";
+import { requestGeoapifyPlaces } from "./geoapify.mjs";
 
 export const NEARBY_RADIUS_METERS = 3000;
 export const OVERPASS_ENDPOINTS = Object.freeze([
+  "https://lz4.overpass-api.de/api/interpreter",
   "https://overpass-api.de/api/interpreter",
   "https://overpass.kumi.systems/api/interpreter",
-  "https://overpass.private.coffee/api/interpreter",
 ]);
+export const DEFAULT_OVERPASS_USER_AGENT =
+  "Wayfarer/1.0 (+https://github.com/moisturizedpotato/Adventure-Companion)";
 
 const MAX_REQUEST_BYTES = 16 * 1024;
 const MAX_RESPONSE_BYTES = 3 * 1024 * 1024;
 const REQUEST_BODY_TIMEOUT_MS = 5000;
 const MAX_TEXT_LENGTH = 300;
-const UPSTREAM_TIMEOUT_MS = 15000;
+const UPSTREAM_TIMEOUT_MS = 20000;
 const MAX_ERROR_BODY_BYTES = 8 * 1024;
 const MAX_RETRY_DELAY_MS = 1500;
 const TRANSIENT_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
@@ -30,6 +33,18 @@ export class NearbyApiError extends Error {
 
 export function buildNearbyQuery({ latitude, longitude, radius, interests, refinement = "" }) {
   const location = `${latitude.toFixed(3)},${longitude.toFixed(3)}`;
+  const categoryFilters = {
+    green: `nwr(around:${radius},${location})["name"]["leisure"~"^(park|garden|nature_reserve)$"];`,
+    quiet: `nwr(around:${radius},${location})["name"]["amenity"~"^(library|cafe)$"];nwr(around:${radius},${location})["name"]["shop"="books"];`,
+    culture: `nwr(around:${radius},${location})["name"]["tourism"~"^(museum|gallery|attraction|artwork)$"];nwr(around:${radius},${location})["name"]["amenity"~"^(museum|arts_centre|theatre|cinema)$"];`,
+    food: `nwr(around:${radius},${location})["name"]["amenity"~"^(cafe|restaurant|fast_food|food_court)$"];`,
+    active: `nwr(around:${radius},${location})["name"]["sport"];nwr(around:${radius},${location})["name"]["leisure"~"^(sports_centre|pitch|skatepark|swimming_pool|climbing)$"];nwr(around:${radius},${location})["name"]["tourism"="viewpoint"];`,
+  };
+  const requestedCategories = interests.split(",").map((item) => item.trim()).filter((item) => item in categoryFilters);
+  if (!refinement && requestedCategories.length) {
+    const filters = [...new Set(requestedCategories)].slice(0, 3).map((category) => categoryFilters[category]).join("");
+    return `[out:json][timeout:18];(${filters});out center tags 120;`;
+  }
   const adventureInterest = /adventure|thrill|active|explor|outdoor|activity|sport|hike|climb/i.test(interests);
   const studyInterest = /stud|learn|read|book|quiet|work/i.test(interests);
   const refinedActivity = /kayak|canoe|paddl|whitewater/i.test(refinement)
@@ -52,7 +67,7 @@ export function buildNearbyQuery({ latitude, longitude, radius, interests, refin
     : studyInterest
       ? `nwr(around:${radius},${location})["name"]["amenity"~"^(library|university|college|cafe|coworking_space|community_centre)$"];nwr(around:${radius},${location})["name"]["shop"="books"];nwr(around:${radius},${location})["name"]["leisure"~"^(park|garden)$"];`
       : `nwr(around:${radius},${location})["name"]["amenity"~"^(library|university|college|cafe|coworking_space|arts_centre|community_centre|museum|climbing|escape_game|amusement_arcade|bowling_alley|theatre|cinema)$"];nwr(around:${radius},${location})["name"]["leisure"~"^(park|garden|nature_reserve|sports_centre|climbing|water_park|adventure_park|escape_game)$"];nwr(around:${radius},${location})["name"]["tourism"~"^(museum|gallery|attraction|viewpoint|artwork|theme_park)$"];nwr(around:${radius},${location})["name"]["historic"];nwr(around:${radius},${location})["name"]["shop"="books"];`;
-  return `[out:json][timeout:12];(${refinedActivity || filters});out center tags 250;`;
+  return `[out:json][timeout:18];(${refinedActivity || filters});out center tags 120;`;
 }
 
 export function validateNearbySearchInput(value) {
@@ -82,7 +97,7 @@ function isAbortError(error) {
   return error instanceof Error && error.name === "AbortError";
 }
 
-function configuredUserAgent(value = process.env.OVERPASS_USER_AGENT) {
+function configuredUserAgent(value = process.env.OVERPASS_USER_AGENT ?? DEFAULT_OVERPASS_USER_AGENT) {
   if (typeof value !== "string" || value.trim().length === 0 || value.length > 512 || /[\u0000-\u001f\u007f]/.test(value)) {
     throw new NearbyApiError(
       503,
@@ -424,12 +439,16 @@ export function createOverpassHandler(options = {}) {
       if (!response.writableEnded) abortRequest();
     });
 
+    let validatedInput;
     try {
       const input = validateNearbySearchInput(await readRequestJson(request, options.requestBodyTimeoutMs));
+      validatedInput = input;
       const elements = await requestNearbyElements(input, { ...options, signal: controller.signal });
+      if (elements.length === 0 && await sendGeoapifyFallback(input, response, controller.signal, options)) return true;
       if (!response.destroyed) {
         sendJson(response, 200, {
           outcome: elements.length === 0 ? "no_results" : "ok",
+          provider: "openstreetmap",
           elements,
         });
       }
@@ -438,6 +457,7 @@ export function createOverpassHandler(options = {}) {
       const apiError = error instanceof NearbyApiError
         ? error
         : new NearbyApiError(500, "upstream_failure", "Nearby place search failed unexpectedly.", false);
+      if (validatedInput && apiError.code !== "cancelled" && apiError.code !== "invalid_input" && await sendGeoapifyFallback(validatedInput, response, controller.signal, options)) return true;
       if (apiError.upstreamAttempts) {
         const logger = options.logger ?? console;
         logger.warn("Nearby search upstream attempts failed.", {
@@ -460,4 +480,20 @@ export function createOverpassHandler(options = {}) {
     }
     return true;
   };
+}
+
+async function sendGeoapifyFallback(input, response, signal, options) {
+  const apiKey = options.geoapifyApiKey ?? process.env.GEOAPIFY_API_KEY;
+  if (typeof apiKey !== "string" || !apiKey.trim() || response.destroyed) return false;
+  try {
+    const places = await requestGeoapifyPlaces(input, { ...options, apiKey, signal });
+    if (response.destroyed) return true;
+    sendJson(response, 200, { outcome: places.length ? "ok" : "no_results", provider: "geoapify", places });
+    return true;
+  } catch (error) {
+    if (signal.aborted || response.destroyed) return true;
+    const logger = options.logger ?? console;
+    logger.warn("Geoapify fallback search failed.", { code: error instanceof Error ? "provider_failure" : "unknown_failure" });
+    return false;
+  }
 }

@@ -3,6 +3,7 @@ import { readFile, stat } from "node:fs/promises";
 import { extname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createOverpassHandler } from "./server/overpass.mjs";
+import { createElevenLabsHandler } from "./server/elevenlabs.mjs";
 
 const ROOT = fileURLToPath(new URL(".", import.meta.url));
 const DIST = resolve(ROOT, "dist");
@@ -66,8 +67,10 @@ async function serveStatic(request, response) {
 }
 
 const handleOverpassRequest = createOverpassHandler();
+const handleElevenLabsRequest = createElevenLabsHandler();
 const server = createServer(async (request, response) => {
   try {
+    if (await handleElevenLabsRequest(request, response)) return;
     if (await handleOverpassRequest(request, response)) return;
     if (new URL(request.url, "http://localhost").pathname.startsWith("/api/")) {
       response.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });

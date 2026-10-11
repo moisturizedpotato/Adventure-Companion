@@ -6,6 +6,7 @@ import { parseMapCoordinates } from "../src/mapCoordinates.mjs";
 import {
   buildNearbyQuery,
   createOverpassHandler,
+  DEFAULT_OVERPASS_USER_AGENT,
   NEARBY_RADIUS_METERS,
   OVERPASS_ENDPOINTS,
   NearbyApiError,
@@ -60,10 +61,10 @@ test("validates coordinates, the fixed search radius, and text bounds", () => {
 
 test("builds a bounded, rounded, interest-filtered Overpass query from validated input", () => {
   const query = buildNearbyQuery(validInput);
-  assert.match(query, /^\[out:json\]\[timeout:12\];/);
+  assert.match(query, /^\[out:json\]\[timeout:18\];/);
   assert.match(query, /around:3000,42\.360,-71\.059/);
   assert.match(query, /"sport"~/);
-  assert.match(query, /out center tags 250;$/);
+  assert.match(query, /out center tags 120;$/);
 
   const maliciousText = buildNearbyQuery({
     ...validInput,
@@ -71,6 +72,14 @@ test("builds a bounded, rounded, interest-filtered Overpass query from validated
     refinement: '");node;/*',
   });
   assert.doesNotMatch(maliciousText, /out geom|node;/);
+});
+
+test("builds a narrow category query without sending or embedding raw mood text", () => {
+  const query = buildNearbyQuery({ ...validInput, interests: "green,quiet", refinement: "" });
+  assert.match(query, /"leisure"~"\^\(park\|garden\|nature_reserve\)\$"/);
+  assert.match(query, /"amenity"~"\^\(library\|cafe\)\$"/);
+  assert.doesNotMatch(query, /my private mood|my secret/);
+  assert.match(query, /out center tags 120;$/);
 });
 
 async function startApiServer(options = {}) {
@@ -123,7 +132,24 @@ test("nearby endpoint validates input before any upstream request", async (t) =>
   assert.equal(upstreamCalls, 0);
 });
 
-test("requires an explicitly configured Overpass User-Agent before making a request", async (t) => {
+test("uses the repository URL in its default Overpass User-Agent", async (t) => {
+  let sentUserAgent;
+  const server = await startApiServer({
+    userAgent: undefined,
+    fetchImpl: async (_, options) => {
+      sentUserAgent = options.headers["User-Agent"];
+      return Response.json({ elements: [] });
+    },
+  });
+  t.after(() => server.close());
+
+  const response = await postNearby(server);
+  assert.equal(response.status, 200);
+  assert.equal(sentUserAgent, DEFAULT_OVERPASS_USER_AGENT);
+  assert.match(sentUserAgent, /^Wayfarer\/1\.0 \(\+https:\/\/github\.com\/moisturizedpotato\/Adventure-Companion\)$/);
+});
+
+test("rejects an invalid explicit Overpass User-Agent before making a request", async (t) => {
   let upstreamCalls = 0;
   const server = await startApiServer({
     userAgent: "",
@@ -138,7 +164,6 @@ test("requires an explicitly configured Overpass User-Agent before making a requ
   const payload = await response.json();
   assert.equal(response.status, 503);
   assert.equal(payload.error.code, "configuration_required");
-  assert.match(payload.error.message, /OVERPASS_USER_AGENT/);
   assert.equal(upstreamCalls, 0);
 });
 

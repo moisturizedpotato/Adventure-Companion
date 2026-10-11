@@ -8,6 +8,11 @@ import {
   loadGemma,
   unloadGemma,
   writeGemmaDiary,
+  PHOTO_VISION_MODEL_SIZE,
+  PHOTO_VISION_REQUIRED_GPU_MEMORY_MB,
+  replyWithGemma,
+  rankNearbyPlacesWithGemma,
+  type OutingChatMessage,
 } from "./gemma";
 
 type Profile = {
@@ -24,10 +29,12 @@ type Place = {
   locality: string;
   details: string;
   interests: string;
-  source?: "openstreetmap";
+  source?: "openstreetmap" | "geoapify";
   osmType?: "node" | "way" | "relation";
   osmId?: number;
   category?: string;
+  matchReason?: string;
+  mapUrl?: string;
 };
 
 type OverpassElement = {
@@ -38,6 +45,8 @@ type OverpassElement = {
 
 type OverpassResponse = {
   elements?: OverpassElement[];
+  provider?: "openstreetmap" | "geoapify";
+  places?: Array<{ id: string; name: string; latitude: number; longitude: number; category: string; locality?: string; interests: string; details: string; mapUrl: string }>;
 };
 
 type GeocodingResult = {
@@ -55,6 +64,7 @@ type DiaryEntry = {
   createdAt: number;
   story: string;
   moments: string[];
+  photoDataUrl?: string;
 };
 
 type OutingPlan = {
@@ -66,12 +76,15 @@ type OutingPlan = {
   friendPreferences: string;
   place: Place;
   narrativeSeed?: number;
+  nearbySearchUnavailable?: boolean;
 };
 
 type SessionDraft = {
   notes: string;
   mood: string;
   moments: string[];
+  conversation?: OutingChatMessage[];
+  photoDataUrl?: string;
 };
 
 type AppData = {
@@ -85,9 +98,23 @@ type AppData = {
 type Screen = "onboarding" | "home" | "suggestion" | "outing" | "wrap-up" | "diary" | "entry" | "settings";
 type GemmaPhase = "checking" | "unsupported" | "available" | "loading" | "ready" | "forgetting" | "error";
 type GemmaStatus = { phase: GemmaPhase; message: string; progress: number };
+type BrowserRecognition = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((event: { resultIndex: number; results: ArrayLike<{ isFinal: boolean; 0: { transcript: string } }> }) => void) | null;
+  onend: (() => void) | null;
+  onerror: ((event: { error: string }) => void) | null;
+  start: () => void;
+  stop: () => void;
+};
+type BrowserRecognitionConstructor = new () => BrowserRecognition;
 
 const STORAGE_KEY = "wayfarer.local.v1";
 const NEARBY_RADIUS_METERS = 3000;
+const MAX_DIARY_PHOTO_DATA_URL_LENGTH = 300_000;
+const MAX_SOURCE_IMAGE_BYTES = 20 * 1024 * 1024;
+const PHOTO_DIARY_MOMENT = "A photo is attached to this diary entry.";
 const GPS_AREA_LABEL = "Near my current location (3 km search)";
 const EMPTY_PROFILE: Profile = { name: "", about: "", interests: "", outingStyle: "", locality: "" };
 const EMPTY_DRAFT: SessionDraft = { notes: "", mood: "", moments: [] };
@@ -97,6 +124,45 @@ const NAV_ITEMS: { screen: Screen; label: string; icon: string }[] = [
   { screen: "diary", label: "My diary", icon: "book" },
   { screen: "settings", label: "Settings", icon: "settings" },
 ];
+
+async function prepareDiaryPhoto(file: Blob): Promise<string> {
+  if (file.size > MAX_SOURCE_IMAGE_BYTES) {
+    throw new Error("Choose an image smaller than 20 MB.");
+  }
+  if (typeof createImageBitmap !== "function") {
+    throw new Error("This browser cannot prepare a photo for local diary storage.");
+  }
+
+  let bitmap: ImageBitmap;
+  try {
+    bitmap = await createImageBitmap(file);
+  } catch {
+    throw new Error("This image could not be opened. Choose a different image file.");
+  }
+
+  try {
+    for (const maxDimension of [1280, 1024, 800, 640]) {
+      const scale = Math.min(1, maxDimension / Math.max(bitmap.width, bitmap.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+      canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("The browser could not prepare this image for storage.");
+      context.fillStyle = "#fff";
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+
+      for (const quality of [0.82, 0.68, 0.54, 0.4]) {
+        const dataUrl = canvas.toDataURL("image/jpeg", quality);
+        if (dataUrl.length <= MAX_DIARY_PHOTO_DATA_URL_LENGTH) return dataUrl;
+      }
+    }
+  } finally {
+    bitmap.close();
+  }
+
+  throw new Error("This image could not be reduced enough for local diary storage.");
+}
 
 function readSavedData(): { data: AppData; error: string } {
   try {
@@ -144,6 +210,21 @@ function describeOsmElement(tags: Record<string, string>, interests: string): { 
   return { category, interestLabels };
 }
 
+function openStreetMapCategories(mood: string): string {
+  const text = mood.toLowerCase();
+  const categories: string[] = [];
+  if (/quiet|calm|rest|stress|overwhelm|tired|slow|fresh air|walk|nature|green|peace|reflect|anxious/.test(text)) categories.push("green", "quiet");
+  if (/book|read|study|learn|quiet|calm|focus|work/.test(text)) categories.push("quiet");
+  if (/art|museum|creative|culture|inspire|curious/.test(text)) categories.push("culture");
+  if (/coffee|cafe|food|eat|hungry|treat|drink|delicious/.test(text)) categories.push("food");
+  if (/active|sport|hike|climb|adventure|thrill|energy|move|cycle/.test(text)) categories.push("active");
+  const uniqueCategories = [...new Set(categories.length ? categories : ["green", "quiet", "culture"])];
+  if (uniqueCategories.includes("quiet") && uniqueCategories.includes("food")) {
+    return uniqueCategories.filter((category) => category !== "food").slice(0, 3).join(",");
+  }
+  return uniqueCategories.slice(0, 3).join(",");
+}
+
 async function fetchNearbyPlaces(latitude: number, longitude: number, interests: string, signal: AbortSignal, refinement = "", placeLocality = "your current location"): Promise<Place[]> {
   const response = await fetch("/api/nearby", {
     method: "POST",
@@ -152,7 +233,7 @@ async function fetchNearbyPlaces(latitude: number, longitude: number, interests:
       latitude: Number(latitude.toFixed(3)),
       longitude: Number(longitude.toFixed(3)),
       radius: NEARBY_RADIUS_METERS,
-      interests,
+      interests: openStreetMapCategories(interests),
       refinement,
     }),
     signal,
@@ -171,7 +252,26 @@ async function fetchNearbyPlaces(latitude: number, longitude: number, interests:
     if (typeof error?.message === "string") throw new Error(error.message);
     throw new Error(`Nearby search failed with HTTP ${response.status}. Your entered details are unchanged; try again shortly.`);
   }
-  const elements = (payload as OverpassResponse).elements;
+  const nearbyPayload = payload as OverpassResponse;
+  if (nearbyPayload.provider === "geoapify") {
+    if (!Array.isArray(nearbyPayload.places)) {
+      throw new Error("Nearby search returned malformed place data. Try again; your entered details are unchanged.");
+    }
+    return nearbyPayload.places
+      .filter((place) => place && typeof place.id === "string" && typeof place.name === "string" &&
+        Number.isFinite(place.latitude) && Number.isFinite(place.longitude))
+      .map((place) => ({
+        id: place.id,
+        name: place.name,
+        locality: place.locality || placeLocality,
+        details: place.details,
+        interests: place.interests,
+        source: "geoapify",
+        category: place.category,
+        mapUrl: place.mapUrl,
+      }));
+  }
+  const elements = nearbyPayload.elements;
   if (!Array.isArray(elements)) {
     throw new Error("Nearby search returned malformed place data. Try again; your entered details are unchanged.");
   }
@@ -303,7 +403,9 @@ export default function App() {
   const [selectedEntryId, setSelectedEntryId] = useState("");
   const [storageError, setStorageError] = useState(initial.error);
   const [online, setOnline] = useState(navigator.onLine);
-  const [localVoiceAvailable, setLocalVoiceAvailable] = useState(false);
+  const [elevenLabsConfigured, setElevenLabsConfigured] = useState(false);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const [gemmaStatus, setGemmaStatus] = useState<GemmaStatus>({ phase: "checking", message: "Checking this browser for local Gemma support…", progress: 0 });
   const [toast, setToast] = useState("");
 
@@ -332,13 +434,39 @@ export default function App() {
     setGemmaStatus({ phase: "forgetting", message: "Unloading Gemma and removing its cached model files…", progress: 0 });
     try {
       await forgetGemma();
-      setGemmaStatus({ phase: "available", message: "Gemma and its cached model files were removed from this browser.", progress: 0 });
+      setGemmaStatus({ phase: "available", message: "Gemma and the cached photo model were removed from this browser.", progress: 0 });
     } catch (error) {
       setGemmaStatus({
         phase: "error",
         message: `Gemma could not be fully removed from browser storage. ${error instanceof Error ? error.message : "Unknown storage error."}`,
         progress: 0,
       });
+    }
+  }
+
+  async function generateDiary(
+    plan: DiaryPlan,
+    draft: DiaryDraft,
+    options: { analyzePhoto?: boolean; onProgress?: (message: string) => void } = {},
+  ): Promise<string> {
+    setGemmaStatus({ phase: "loading", message: "Writing your diary on this device…", progress: 0 });
+    try {
+      const story = await writeGemmaDiary(plan, draft, {
+        ...options,
+        onProgress: (message) => {
+          setGemmaStatus({ phase: "loading", message, progress: 0 });
+          options.onProgress?.(message);
+        },
+      });
+      setGemmaStatus({ phase: "ready", message: "Gemma is loaded on this device. Diary prompts run locally.", progress: 100 });
+      return story;
+    } catch (error) {
+      setGemmaStatus({
+        phase: "error",
+        message: `Local diary generation failed. ${error instanceof Error ? error.message : "Try loading Gemma again."}`,
+        progress: 0,
+      });
+      throw error;
     }
   }
 
@@ -361,6 +489,67 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    let active = true;
+    void fetch("/api/voice/status").then((response) => response.ok ? response.json() : null).then((status) => {
+      if (active && status && typeof status.configured === "boolean") setElevenLabsConfigured(status.configured);
+    }).catch(() => undefined);
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => () => {
+    audioSourceRef.current?.stop();
+    void audioContextRef.current?.close();
+  }, []);
+
+  async function unlockVoiceAudio() {
+    if (!("AudioContext" in window)) return;
+    audioContextRef.current ??= new AudioContext();
+    await audioContextRef.current.resume();
+  }
+
+  async function speakWithElevenLabs(text: string) {
+    if (!text.trim()) return;
+    try {
+      audioSourceRef.current?.stop();
+      await unlockVoiceAudio();
+      const response = await fetch("/api/voice/speak", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: text.slice(0, 5000) }),
+      });
+      if (!response.ok) {
+        const result = await response.json().catch(() => null);
+        throw new Error(result?.error?.message ?? "ElevenLabs speech generation failed.");
+      }
+      const blob = await response.blob();
+      if (audioContextRef.current) {
+        const decoded = await audioContextRef.current.decodeAudioData(await blob.arrayBuffer());
+        const source = audioContextRef.current.createBufferSource();
+        source.buffer = decoded;
+        source.connect(audioContextRef.current.destination);
+        audioSourceRef.current = source;
+        await new Promise<void>((resolve) => {
+          source.onended = () => { if (audioSourceRef.current === source) audioSourceRef.current = null; resolve(); };
+          source.start();
+        });
+      } else {
+        const audioUrl = URL.createObjectURL(blob);
+        const audio = new Audio(audioUrl);
+        audio.onended = () => URL.revokeObjectURL(audioUrl);
+        audio.onerror = () => URL.revokeObjectURL(audioUrl);
+        await audio.play();
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Speech playback failed.";
+      setToast(message);
+    }
+  }
+
+  async function getCompanionReply(messages: OutingChatMessage[], plan: OutingPlan) {
+    return replyWithGemma(messages, { place: plan.place.name, locality: plan.locality });
+  }
+
+  useEffect(() => {
     setOnline(navigator.onLine);
     const updateOnline = () => setOnline(navigator.onLine);
     window.addEventListener("online", updateOnline);
@@ -372,24 +561,11 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const updateVoices = () => {
-      setLocalVoiceAvailable(
-        "speechSynthesis" in window && speechSynthesis.getVoices().some((voice) => voice.localService),
-      );
-    };
-    updateVoices();
-    if ("speechSynthesis" in window) speechSynthesis.addEventListener("voiceschanged", updateVoices);
-    return () => {
-      if ("speechSynthesis" in window) speechSynthesis.removeEventListener("voiceschanged", updateVoices);
-    };
-  }, []);
-
-  useEffect(() => {
     if (storageError) return;
     try {
       const hasContent = Object.values(data.profile).some((value) => value.trim()) ||
         data.places.length > 0 || data.entries.length > 0 || data.plan !== null ||
-        Boolean(data.draft.notes.trim() || data.draft.mood.trim() || data.draft.moments.length);
+        Boolean(data.draft.notes.trim() || data.draft.mood.trim() || data.draft.moments.length || data.draft.photoDataUrl);
       if (hasContent) localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
       else localStorage.removeItem(STORAGE_KEY);
     } catch (error) {
@@ -432,7 +608,23 @@ export default function App() {
   }
 
   function updateDraft(draft: SessionDraft) {
-    updateData((current) => ({ ...current, draft }));
+    updateData((current) => ({
+      ...current,
+      draft: { ...draft, conversation: current.draft.conversation ?? draft.conversation },
+    }));
+  }
+
+  function updateDraftPhoto(photoDataUrl: string | undefined) {
+    updateData((current) => ({
+      ...current,
+      draft: {
+        ...current.draft,
+        photoDataUrl,
+        moments: photoDataUrl
+          ? current.draft.moments
+          : current.draft.moments.filter((moment) => moment !== PHOTO_DIARY_MOMENT),
+      },
+    }));
   }
 
   function deleteEntry(id: string) {
@@ -509,7 +701,7 @@ export default function App() {
         </nav>
         <div className="sidebar-bottom">
           <div className="privacy-chip"><Icon name="lock" size={15} /><span>Your stories stay yours</span></div>
-          <p className="sidebar-disclaimer">No account or cloud AI. GPS, manual map-point and area searches use OpenStreetMap only when you ask.</p>
+          <p className="sidebar-disclaimer">No account. Diary writing and conversation stay on-device; chosen speech features use their disclosed providers.</p>
         </div>
       </aside>
 
@@ -525,6 +717,7 @@ export default function App() {
             <Home
               profile={data.profile}
               places={data.places}
+              gemmaReady={gemmaStatus.phase === "ready"}
               onProfileChange={(profile) => updateData((current) => ({ ...current, profile }))}
               onAddPlace={addPlace}
               onSuggest={savePlan}
@@ -532,21 +725,7 @@ export default function App() {
             />
           )}
           {screen === "suggestion" && data.plan && <Suggestion plan={data.plan} onStart={() => setScreen("outing")} onBack={() => setScreen("home")} />}
-          {screen === "outing" && data.plan && <Outing plan={data.plan} draft={data.draft} localVoiceAvailable={localVoiceAvailable} onDraftChange={updateDraft} onEnd={() => setScreen("wrap-up")} onSpeak={(text) => {
-            if (!localVoiceAvailable || !("speechSynthesis" in window)) {
-              setToast("A local text-to-speech voice isn’t available in this browser. Your typed notes still work.");
-              return;
-            }
-            const localVoice = speechSynthesis.getVoices().find((voice) => voice.localService);
-            if (!localVoice) {
-              setToast("A local text-to-speech voice isn’t available in this browser. Your typed notes still work.");
-              return;
-            }
-            speechSynthesis.cancel();
-            const utterance = new SpeechSynthesisUtterance(text);
-            utterance.voice = localVoice;
-            speechSynthesis.speak(utterance);
-          }} />}
+          {screen === "outing" && data.plan && <Outing plan={data.plan} draft={data.draft} gemmaReady={gemmaStatus.phase === "ready"} elevenLabsConfigured={elevenLabsConfigured} onDraftChange={updateDraft} onConversationChange={(conversation) => updateData((current) => ({ ...current, draft: { ...current.draft, conversation } }))} onPhotoChange={updateDraftPhoto} onEnd={() => setScreen("wrap-up")} onSpeak={speakWithElevenLabs} onUnlockAudio={unlockVoiceAudio} onReply={getCompanionReply} />}
           {screen === "wrap-up" && data.plan && <WrapUp
             plan={data.plan}
             draft={data.draft}
@@ -556,16 +735,16 @@ export default function App() {
             onBack={() => setScreen("outing")}
             onSetupGemma={setupGemma}
             onForgetGemma={removeGemma}
-            onGenerate={writeGemmaDiary}
+            onGenerate={generateDiary}
           />}
           {screen === "diary" && (
             <DiaryLibrary entries={data.entries} onOpen={(entry) => { setSelectedEntryId(entry.id); setScreen("entry"); }} onCreate={() => setScreen("home")} />
           )}
-          {screen === "entry" && selectedEntry && <DiaryView entry={selectedEntry} onBack={() => setScreen("diary")} onDelete={() => deleteEntry(selectedEntry.id)} />}
+          {screen === "entry" && selectedEntry && <DiaryView entry={selectedEntry} elevenLabsConfigured={elevenLabsConfigured} onSpeak={speakWithElevenLabs} onBack={() => setScreen("diary")} onDelete={() => deleteEntry(selectedEntry.id)} />}
           {screen === "entry" && !selectedEntry && <EmptyEntry onBack={() => setScreen("diary")} />}
           {screen === "settings" && <Settings
             data={data}
-            localVoiceAvailable={localVoiceAvailable}
+            elevenLabsConfigured={elevenLabsConfigured}
             gemmaStatus={gemmaStatus}
             onSetupGemma={setupGemma}
             onForgetGemma={removeGemma}
@@ -648,9 +827,9 @@ function Onboarding({ profile, onComplete }: { profile: Profile; onComplete: (pr
 }
 
 function Home({
-  profile, places, onProfileChange, onAddPlace, onSuggest, onDiary,
+  profile, places, gemmaReady, onProfileChange, onAddPlace, onSuggest, onDiary,
 }: {
-  profile: Profile; places: Place[]; onProfileChange: (profile: Profile) => void; onAddPlace: (place: Place) => void;
+  profile: Profile; places: Place[]; gemmaReady: boolean; onProfileChange: (profile: Profile) => void; onAddPlace: (place: Place) => void;
   onSuggest: (plan: OutingPlan) => void; onDiary: () => void;
 }) {
   const [locality, setLocality] = useState(profile.locality);
@@ -671,6 +850,7 @@ function Home({
   const [nearbyPlaces, setNearbyPlaces] = useState<Place[]>([]);
   const [nearbyStatus, setNearbyStatus] = useState("");
   const [nearbyError, setNearbyError] = useState("");
+  const [nearbySearchUnavailable, setNearbySearchUnavailable] = useState(false);
   const [nearbyLoading, setNearbyLoading] = useState(false);
   const [showManualLocation, setShowManualLocation] = useState(false);
   const [manualLocationInput, setManualLocationInput] = useState("");
@@ -681,6 +861,23 @@ function Home({
   const [nearbyAreaLabel, setNearbyAreaLabel] = useState(GPS_AREA_LABEL);
   const [searchPosition, setSearchPosition] = useState<{ latitude: number; longitude: number; locality: string } | null>(null);
   const nearbyController = useRef<AbortController | null>(null);
+
+  async function matchNearbyPlaces(results: Place[]): Promise<Place[]> {
+    if (!gemmaReady || !results.length || !interests.trim()) return results;
+    try {
+      const ranking = await rankNearbyPlacesWithGemma(interests, results);
+      if (!ranking.length) return results;
+      const byId = new Map(results.map((place) => [place.id, place]));
+      const ranked = ranking.flatMap(({ id, reason }) => {
+        const place = byId.get(id);
+        return place ? [{ ...place, matchReason: reason }] : [];
+      });
+      const rankedIds = new Set(ranked.map((place) => place.id));
+      return [...ranked, ...results.filter((place) => !rankedIds.has(place.id))];
+    } catch {
+      return results;
+    }
+  }
 
   useEffect(() => () => nearbyController.current?.abort(), []);
 
@@ -697,6 +894,7 @@ function Home({
     const controller = new AbortController();
     nearbyController.current = controller;
     setNearbyLoading(true);
+    setNearbySearchUnavailable(false);
     setNearbyError("");
     setNearbyStatus("");
     setNearbyPlaces([]);
@@ -705,20 +903,24 @@ function Home({
     setVisibleNearbyCount(6);
     setRefinedInterests("");
     setShowMoreOptions(false);
+    let requestedNearbySearch = false;
     try {
       const position = await requestDevicePosition();
       if (controller.signal.aborted) return;
       setSearchPosition({ latitude: position.coords.latitude, longitude: position.coords.longitude, locality: "your current location" });
       setNearbyAreaLabel(GPS_AREA_LABEL);
       setNearbyStatus("Location allowed. Looking for named places within 3 km of this device…");
-      const results = await fetchNearbyPlaces(position.coords.latitude, position.coords.longitude, interests, controller.signal, "", "your current location");
+      requestedNearbySearch = true;
+      const results = await matchNearbyPlaces(await fetchNearbyPlaces(position.coords.latitude, position.coords.longitude, interests, controller.signal, "", "your current location"));
       if (controller.signal.aborted) return;
+      setNearbySearchUnavailable(false);
       setLocality(GPS_AREA_LABEL);
       setNearbyPlaces(results);
-      if (!results.length) setNearbyStatus("No named places matching these interests appeared in the 3 km OpenStreetMap search. Try another interest or add a place you know.");
-      else setNearbyStatus(`Found ${results.length} named places in OpenStreetMap within 3 km. Choose one to use.`);
+      if (!results.length) setNearbyStatus("No named places matching these interests appeared in the 3 km nearby search. Try another interest or add a place you know.");
+      else setNearbyStatus(`Found ${results.length} named places within 3 km. Choose one to use.`);
     } catch (error) {
       if (controller.signal.aborted) return;
+      if (requestedNearbySearch) setNearbySearchUnavailable(true);
       setShowManualLocation(true);
       setNearbyError(error instanceof Error ? error.message : "Nearby place search failed. You can still enter a place manually.");
       setNearbyStatus("");
@@ -737,6 +939,7 @@ function Home({
     const controller = new AbortController();
     nearbyController.current = controller;
     setNearbyLoading(true);
+    setNearbySearchUnavailable(false);
     setNearbyError("");
     setNearbyStatus(`Finding the approximate centre of “${area}”…`);
     setNearbyPlaces([]);
@@ -744,6 +947,7 @@ function Home({
     setVisibleNearbyCount(6);
     setRefinedInterests("");
     setShowMoreOptions(false);
+    let requestedNearbySearch = false;
     try {
       const geocodeUrl = new URL("https://nominatim.openstreetmap.org/search");
       geocodeUrl.searchParams.set("format", "jsonv2");
@@ -773,15 +977,18 @@ function Home({
       const areaLabel = `Near ${placeLabel} (3 km search)`;
       setNearbyAreaLabel(areaLabel);
       setNearbyStatus(`Searching within 3 km of the mapped centre of ${placeLabel}…`);
-      const results = await fetchNearbyPlaces(Number(result.lat), Number(result.lon), interests, controller.signal, "", placeLabel);
+      requestedNearbySearch = true;
+      const results = await matchNearbyPlaces(await fetchNearbyPlaces(Number(result.lat), Number(result.lon), interests, controller.signal, "", placeLabel));
       if (controller.signal.aborted) return;
+      setNearbySearchUnavailable(false);
       setLocality(areaLabel);
       setNearbyPlaces(results);
       setNearbyStatus(results.length
-        ? `Found ${results.length} named places within 3 km of the mapped centre of ${placeLabel}. Choose one to use.`
+        ? `${results.some((place) => place.matchReason) ? "Gemma ranked these for your mood. " : gemmaReady ? "Gemma could not rank these this time. " : "Load Gemma in Settings to match these to your mood. "}Found ${results.length} named places within 3 km of the mapped centre of ${placeLabel}. Choose one to use.`
         : `No named places matching these interests appeared within 3 km of ${placeLabel}. Try another area or add a place you know.`);
     } catch (error) {
       if (controller.signal.aborted) return;
+      if (requestedNearbySearch) setNearbySearchUnavailable(true);
       setNearbyError(error instanceof Error ? error.message : "The typed area search failed. You can still try GPS or add a place manually.");
       setNearbyStatus("");
     } finally {
@@ -801,6 +1008,7 @@ function Home({
     const placeLabel = "your manually selected map point";
     const areaLabel = "Near selected map point (3 km search)";
     setNearbyLoading(true);
+    setNearbySearchUnavailable(false);
     setNearbyError("");
     setNearbyPlaces([]);
     setChosenPlaceId("");
@@ -810,23 +1018,27 @@ function Home({
     setSearchPosition({ ...coordinates, locality: placeLabel });
     setNearbyAreaLabel(areaLabel);
     setNearbyStatus("Searching within 3 km of the map point you selected…");
+    let requestedNearbySearch = false;
     try {
-      const results = await fetchNearbyPlaces(
+      requestedNearbySearch = true;
+      const results = await matchNearbyPlaces(await fetchNearbyPlaces(
         coordinates.latitude,
         coordinates.longitude,
         interests,
         controller.signal,
         "",
         placeLabel,
-      );
+      ));
       if (controller.signal.aborted) return;
+      setNearbySearchUnavailable(false);
       setLocality(areaLabel);
       setNearbyPlaces(results);
       setNearbyStatus(results.length
-        ? `Found ${results.length} named places within 3 km of your selected map point. Choose one to use.`
+        ? `${results.some((place) => place.matchReason) ? "Gemma ranked these for your mood. " : gemmaReady ? "Gemma could not rank these this time. " : "Load Gemma in Settings to match these to your mood. "}Found ${results.length} named places within 3 km of your selected map point. Choose one to use.`
         : "No named places matching these interests appeared within 3 km of your selected map point. Try another point or add a place you know.");
     } catch (error) {
       if (controller.signal.aborted) return;
+      if (requestedNearbySearch) setNearbySearchUnavailable(true);
       setNearbyError(error instanceof Error ? error.message : "The map-point search failed. Check the coordinates or try again.");
       setNearbyStatus("");
     } finally {
@@ -844,18 +1056,22 @@ function Home({
     const controller = new AbortController();
     nearbyController.current = controller;
     setNearbyLoading(true);
+    setNearbySearchUnavailable(false);
     setNearbyError("");
     setNearbyStatus(`Looking nearby for ${refinedInterests.trim()}…`);
+    let requestedNearbySearch = false;
     try {
-      const results = await fetchNearbyPlaces(
+      requestedNearbySearch = true;
+      const results = await matchNearbyPlaces(await fetchNearbyPlaces(
         searchPosition.latitude,
         searchPosition.longitude,
         `${interests} ${refinedInterests.trim()}`,
         controller.signal,
         refinedInterests.trim(),
         searchPosition.locality,
-      );
+      ));
       if (controller.signal.aborted) return;
+      setNearbySearchUnavailable(false);
       if (results.length) {
         setNearbyPlaces(results);
         setChosenPlaceId("");
@@ -866,6 +1082,7 @@ function Home({
       }
     } catch (error) {
       if (controller.signal.aborted) return;
+      if (requestedNearbySearch) setNearbySearchUnavailable(true);
       setNearbyError(error instanceof Error ? error.message : "More nearby options couldn’t be loaded. Try again or keep browsing the current places.");
       setNearbyStatus("");
     } finally {
@@ -888,10 +1105,10 @@ function Home({
       return score(b) - score(a);
     })[0];
     if (!bestMatch) {
-      setError(`I don’t have a confirmed place or OpenStreetMap result for ${locality.trim()} yet. Search nearby with GPS or add a place below.`);
+      setError(`I don’t have a confirmed place or nearby result for ${locality.trim()} yet. Search nearby with GPS or add a place below.`);
       return;
     }
-    const gpsSearch = bestMatch.source === "openstreetmap";
+    const gpsSearch = bestMatch.source === "openstreetmap" || bestMatch.source === "geoapify";
     const outingInterests = [interests.trim(), refinedInterests.trim()].filter(Boolean).join("; especially ");
     onProfileChange({ ...profile, interests: interests.trim(), locality: gpsSearch ? profile.locality : locality.trim() });
     onSuggest({
@@ -903,6 +1120,7 @@ function Home({
       friendPreferences: friendPreferences.trim(),
       place: bestMatch,
       narrativeSeed: hashText(crypto.randomUUID()),
+            nearbySearchUnavailable: nearbySearchUnavailable && !gpsSearch,
     });
   }
 
@@ -962,13 +1180,13 @@ function Home({
           <div className="gps-search-card">
             <div className="gps-search-copy">
               <strong>Need somewhere nearby?</strong>
-              <span>Share your current device location to find nearby places matched to your interests in OpenStreetMap. This searches where you are now, not the town typed above.</span>
+            <span>Share your current device location to find nearby places matched to your mood and interests. Gemma can rank the returned places locally. This searches where you are now, not the town typed above.</span>
             </div>
-            <p className="gps-consent-note">GPS works only after browser permission. Coordinates rounded to about 100 m and your interests go to this app’s nearby-search server, which requests a 3 km search from OpenStreetMap. This app does not save the coordinates.</p>
+            <p className="gps-consent-note">GPS works only after browser permission. Coordinates rounded to about 100 m and broad place categories go to this app’s nearby-search server, which searches OpenStreetMap and may use Geoapify as a fallback. Your mood text stays here for Gemma’s local matching. This app does not save the coordinates.</p>
             <button type="button" className="button button-secondary button-full" onClick={() => { void findNearbyPlaces(); }} disabled={nearbyLoading}>
               <Icon name="pin" size={16} />{nearbyLoading ? "Finding nearby places…" : "Allow GPS & find nearby places"}
             </button>
-            <p className="gps-consent-note">If GPS is slow or unavailable, search the typed area instead. That sends the area text to OpenStreetMap Nominatim for an approximate centre, then sends rounded coordinates and your interests to this app’s nearby-search server. It does not request device location.</p>
+            <p className="gps-consent-note">If GPS is slow or unavailable, search the typed area instead. That sends the area text to OpenStreetMap Nominatim for an approximate centre, then sends rounded coordinates and broad place categories to this app’s nearby-search server, which may use Geoapify as a fallback. It does not request device location.</p>
             <button type="button" className="button button-quiet button-full" onClick={() => { void searchTypedArea(); }} disabled={nearbyLoading || !typedLocality.trim()}>
               {nearbyLoading ? "Searching…" : "Search typed area without GPS"}
             </button>
@@ -983,7 +1201,8 @@ function Home({
             {showManualLocation && (
               <div className="manual-location-panel">
                 <strong>Choose your location on OpenStreetMap</strong>
-                <p>Open the map, move it to where you are, then use its Share panel to copy the map link. Paste that link here; the app reads the map centre. You can also enter latitude, longitude directly.</p>
+                <p>Open the map, move it to where you are, then use its Share panel to copy the map link. Paste that link here; the app reads the map centre. You can also enter latitude, longitude directly. Sample link for Central Park, New York:</p>
+                <button type="button" className="text-link" onClick={() => setManualLocationInput("https://www.openstreetmap.org/#map=16/40.7829/-73.9654")}>Use Central Park sample link</button>
                 <a
                   className="button button-secondary button-full"
                   href={typedLocality.trim()
@@ -994,15 +1213,15 @@ function Home({
                 >
                   Open OpenStreetMap in a new tab ↗
                 </a>
-                <label className="field-label">Coordinates or copied OpenStreetMap link
+                <label className="field-label">Coordinates or copied map link
                   <input
                     value={manualLocationInput}
                     onChange={(event) => setManualLocationInput(event.target.value)}
-                    placeholder="42.3601, -71.0589 or paste a map link"
+                    placeholder="https://www.openstreetmap.org/#map=16/40.7829/-73.9654"
                     autoComplete="off"
                   />
                 </label>
-                <p className="gps-consent-note">When you search, coordinates rounded to about 100 m and your interests are sent to this app’s nearby-search server, which requests results from OpenStreetMap. This does not request GPS or save your location.</p>
+                <p className="gps-consent-note">When you search, coordinates rounded to about 100 m and broad place categories are sent to this app’s nearby-search server, which searches OpenStreetMap and may use Geoapify as a fallback. Your mood text stays here for Gemma’s local matching. This does not request GPS or save your location.</p>
                 <button
                   type="button"
                   className="button button-secondary button-full"
@@ -1013,17 +1232,18 @@ function Home({
                 </button>
               </div>
             )}
-            <div className="osm-attribution"><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">© OpenStreetMap contributors</a> · Open Database License</div>
+            <div className="osm-attribution"><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">© OpenStreetMap contributors</a>{nearbyPlaces.some((place) => place.source === "geoapify") && <> · <a href="https://www.geoapify.com/" target="_blank" rel="noreferrer">Powered by Geoapify</a></>} · Open Database License</div>
             {nearbyStatus && <p className="gps-search-status" role="status">{nearbyStatus}</p>}
             {nearbyError && <p className="form-error" role="alert">{nearbyError}</p>}
             {nearbyPlaces.length > 0 && (
               <>
-                <div className="nearby-results" aria-label="Nearby places from OpenStreetMap">
+                <div className="nearby-results" aria-label="Nearby places from map data providers">
                 {nearbyPlaces.slice(0, visibleNearbyCount).map((place) => (
                   <div className={`nearby-result ${chosenPlaceId === place.id ? "nearby-result-selected" : ""}`} key={place.id}>
                     <div className="nearby-result-copy">
                       <strong>{place.name}</strong>
                       <span>{place.category}{place.interests === "adventure" ? " · adventure idea" : place.interests.includes("studying") || place.interests.includes("learning") ? " · may fit studying" : ""}</span>
+                      {place.matchReason && <span className="nearby-match-reason">Gemma’s take: {place.matchReason}</span>}
                     </div>
                     <button type="button" className="text-link nearby-select" onClick={() => {
                       setChosenPlaceId(place.id);
@@ -1033,7 +1253,11 @@ function Home({
                     }}>
                       I prefer this
                     </button>
-                    <a className="osm-source-link" href={`https://www.openstreetmap.org/${place.osmType}/${place.osmId}`} target="_blank" rel="noreferrer" aria-label={`View ${place.name} OpenStreetMap record`}>OSM ↗</a>
+                    {place.source === "geoapify" && place.mapUrl
+                      ? <a className="osm-source-link" href={place.mapUrl} target="_blank" rel="noreferrer" aria-label={`View ${place.name} on a map`}>Map ↗</a>
+                      : place.osmType && place.osmId !== undefined
+                        ? <a className="osm-source-link" href={`https://www.openstreetmap.org/${place.osmType}/${place.osmId}`} target="_blank" rel="noreferrer" aria-label={`View ${place.name} OpenStreetMap record`}>OSM ↗</a>
+                        : null}
                   </div>
                 ))}
                 </div>
@@ -1050,7 +1274,7 @@ function Home({
                     <label className="field-label">What else are you in the mood for?
                       <input value={refinedInterests} onChange={(event) => setRefinedInterests(event.target.value)} placeholder="Kayaking, climbing, a scenic walk…" />
                     </label>
-                    <span className="field-hint">I’ll keep using this same current location and 3 km radius. OpenStreetMap receives the follow-up search request.</span>
+                    <span className="field-hint">I’ll keep using this same current location and 3 km radius. The map search provider receives the follow-up request.</span>
                     <button type="button" className="button button-secondary button-full" onClick={() => { void findMoreOptions(); }} disabled={nearbyLoading || !refinedInterests.trim()}>
                       {nearbyLoading ? "Looking for options…" : "Find more like this"}
                     </button>
@@ -1070,12 +1294,13 @@ function Home({
           <label className="field-label">What are you in the mood for? <span className="required-mark">*</span>
             <textarea required value={interests} onChange={(event) => setInterests(event.target.value)} placeholder="A little fresh air, something delicious, a slow wander…" rows={2} />
             {profile.interests && <span className="field-hint">I remember you enjoy: {profile.interests}</span>}
+            <span className="field-hint">Nearby results use broad place categories. When Gemma is loaded, it reads this mood locally and ranks the verified map results with a short explanation.</span>
           </label>
           <div className="friend-toggle">
             <label className="toggle-row"><input type="checkbox" checked={friendJoining} onChange={(event) => setFriendJoining(event.target.checked)} /><span className="custom-checkbox" /><span>A friend I know is joining me</span></label>
             {friendJoining && <label className="field-label friend-field">What might they enjoy? <span className="optional-label">OPTIONAL</span><input value={friendPreferences} onChange={(event) => setFriendPreferences(event.target.value)} placeholder="Share whatever you know" /></label>}
           </div>
-          <div className="place-availability"><div className="availability-icon"><Icon name="pin" size={17} /></div><div><strong>{areaPlaces.length ? `${areaPlaces.length} place${areaPlaces.length === 1 ? "" : "s"} available` : "No verified places found yet"}</strong><span>{areaPlaces.some((place) => place.source === "openstreetmap") ? "Named places found in OpenStreetMap; choose one above." : areaPlaces.length ? "Your personally confirmed places." : "Search nearby with GPS or add a place you know."}</span></div></div>
+          <div className="place-availability"><div className="availability-icon"><Icon name="pin" size={17} /></div><div><strong>{areaPlaces.length ? `${areaPlaces.length} place${areaPlaces.length === 1 ? "" : "s"} available` : "No verified places found yet"}</strong><span>{areaPlaces.some((place) => place.source === "openstreetmap" || place.source === "geoapify") ? "Nearby named places found; choose one above." : areaPlaces.length ? "Your personally confirmed places." : "Search nearby with GPS or add a place you know."}</span></div></div>
           {error && <p className="form-error" role="alert">{error}</p>}
           <button className="button button-primary button-full" type="submit">Find me a little adventure <Icon name="arrow" /></button>
           <p className="form-privacy"><Icon name="lock" size={13} /> I won’t make up places, routes or opening times.</p>
@@ -1088,7 +1313,13 @@ function Home({
             <p>{profile.outingStyle ? `${profile.outingStyle} — got it. I'll keep that in mind.` : "I’ll pay attention to what you enjoy, not just what’s nearby."}</p>
             {profile.about && <p className="profile-about">“{profile.about}”</p>}
           </div>
-          <PlaceManager places={places} locality={locality} showForm={showPlaceForm} setShowForm={setShowPlaceForm} placeName={placeName} setPlaceName={setPlaceName} placeArea={placeArea} setPlaceArea={setPlaceArea} placeDetails={placeDetails} setPlaceDetails={setPlaceDetails} placeInterests={placeInterests} setPlaceInterests={setPlaceInterests} placeConfirmed={placeConfirmed} setPlaceConfirmed={setPlaceConfirmed} placeError={placeError} onSubmit={submitPlace} />
+          <PlaceManager places={places} locality={locality} showForm={showPlaceForm} setShowForm={setShowPlaceForm} placeName={placeName} setPlaceName={setPlaceName} placeArea={placeArea} setPlaceArea={setPlaceArea} placeDetails={placeDetails} setPlaceDetails={setPlaceDetails} placeInterests={placeInterests} setPlaceInterests={setPlaceInterests} placeConfirmed={placeConfirmed} setPlaceConfirmed={setPlaceConfirmed} placeError={placeError} onSubmit={submitPlace} onSelectSaved={(place) => {
+            setLocality(place.locality);
+            setTypedLocality(place.locality);
+            setChosenPlaceId(place.id);
+            setError("");
+            setNearbyStatus(`Selected your saved place “${place.name}”. You can use it without live nearby search.`);
+          }} />
           <button type="button" className="diary-teaser" onClick={onDiary}><span className="diary-teaser-icon"><Icon name="book" /></span><span><strong>{profile.name ? `${profile.name}’s diary` : "Your little diary"}</strong><span>Revisit the days you’ve shared.</span></span><Icon name="arrow" size={17} /></button>
         </aside>
       </div>
@@ -1097,11 +1328,11 @@ function Home({
 }
 
 function PlaceManager({
-  places, locality, showForm, setShowForm, placeName, setPlaceName, placeArea, setPlaceArea, placeDetails, setPlaceDetails, placeInterests, setPlaceInterests, placeConfirmed, setPlaceConfirmed, placeError, onSubmit,
+  places, locality, showForm, setShowForm, placeName, setPlaceName, placeArea, setPlaceArea, placeDetails, setPlaceDetails, placeInterests, setPlaceInterests, placeConfirmed, setPlaceConfirmed, placeError, onSubmit, onSelectSaved,
 }: {
   places: Place[]; locality: string; showForm: boolean; setShowForm: (value: boolean) => void; placeName: string; setPlaceName: (value: string) => void;
   placeArea: string; setPlaceArea: (value: string) => void; placeDetails: string; setPlaceDetails: (value: string) => void; placeInterests: string; setPlaceInterests: (value: string) => void;
-  placeConfirmed: boolean; setPlaceConfirmed: (value: boolean) => void; placeError: string; onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  placeConfirmed: boolean; setPlaceConfirmed: (value: boolean) => void; placeError: string; onSubmit: (event: FormEvent<HTMLFormElement>) => void; onSelectSaved: (place: Place) => void;
 }) {
   const [showSaved, setShowSaved] = useState(false);
   return (
@@ -1109,7 +1340,7 @@ function PlaceManager({
       <div className="saved-places-heading"><div><span className="section-kicker">YOUR OWN LITTLE GUIDE</span><h3>Places you trust</h3></div><span className="saved-count">{places.length}</span></div>
       <p>Your own places and nearby places you choose can inspire a plan.</p>
       {places.length > 0 && <button type="button" className="text-link saved-toggle" onClick={() => setShowSaved(!showSaved)}>{showSaved ? "Hide saved places" : "See your saved places"}</button>}
-      {showSaved && places.map((place) => <div className="saved-place-item" key={place.id}><strong>{place.name}</strong><span>{place.locality}{place.interests ? ` · ${place.interests}` : ""}</span></div>)}
+      {showSaved && places.map((place) => <div className="saved-place-item" key={place.id}><strong>{place.name}</strong><span>{place.locality}{place.interests ? ` · ${place.interests}` : ""}</span><button type="button" className="text-link" onClick={() => onSelectSaved(place)}>Use this place</button></div>)}
       <button type="button" className="button button-secondary button-full add-place-button" onClick={() => { setShowForm(!showForm); if (!showForm && locality.trim()) setPlaceArea(locality.trim()); }}>
         <Icon name="plus" size={17} /> {showForm ? "Close place form" : "Add a place you’ve checked"}
       </button>
@@ -1138,9 +1369,10 @@ function Suggestion({ plan, onStart, onBack }: { plan: OutingPlan; onStart: () =
       </section>
       <div className="suggestion-details">
         <div className="suggestion-facts"><span><Icon name="clock" size={17} />{plan.timing}</span><span><Icon name="sun" size={17} />{plan.duration} to wander</span></div>
-        <div className="reason-card"><div className="reason-icon"><Icon name="heart" /></div><div><strong>Why it feels like a fit</strong><p>You said you’re interested in {plan.interests}. {plan.place.source === "openstreetmap" ? `OpenStreetMap categorizes it as ${plan.place.category}${/stud|learn|read|book/i.test(plan.interests) && ["library", "university", "college", "books"].includes(plan.place.category ?? "") ? ", which may suit a study outing" : ""}.` : plan.place.interests ? `You tagged this place with ${plan.place.interests}, too.` : "This is one of your own trusted places."}{plan.friendJoining && plan.friendPreferences.trim() ? ` I kept your friend’s interest in ${plan.friendPreferences} in mind, too.` : ""}</p></div></div>
+        <div className="reason-card"><div className="reason-icon"><Icon name="heart" /></div><div><strong>Why it feels like a fit</strong><p>You said you’re interested in {plan.interests}. {plan.place.source === "geoapify" ? `Geoapify categorizes it as ${plan.place.category}.` : plan.place.source === "openstreetmap" ? `OpenStreetMap categorizes it as ${plan.place.category}${/stud|learn|read|book/i.test(plan.interests) && ["library", "university", "college", "books"].includes(plan.place.category ?? "") ? ", which may suit a study outing" : ""}.` : plan.place.interests ? `You tagged this place with ${plan.place.interests}, too.` : "This is one of your own trusted places."}{plan.friendJoining && plan.friendPreferences.trim() ? ` I kept your friend’s interest in ${plan.friendPreferences} in mind, too.` : ""}</p></div></div>
         {plan.friendJoining && <div className="reason-card friend-reason"><div className="reason-icon"><span>♡</span></div><div><strong>Room for your friend, too</strong><p>{plan.friendPreferences ? `I’ll keep in mind that they enjoy ${plan.friendPreferences}.` : "You can decide together what feels good once you’re there."} No account needed — just the people you already chose.</p></div></div>}
-        <div className="honesty-note"><Icon name="lock" size={15} /><span>{plan.place.source === "openstreetmap" ? <>Place name and category from <a href={`https://www.openstreetmap.org/${plan.place.osmType}/${plan.place.osmId}`} target="_blank" rel="noreferrer">OpenStreetMap</a>. I haven’t checked current access, opening times, or routes.</> : "Based on a place you saved. I haven’t checked current access, opening times, or routes."}</span></div>
+        {plan.nearbySearchUnavailable && <div className="honesty-note" role="status"><Icon name="lock" size={15} /><span>Live nearby search is unavailable right now. This plan uses your saved place instead.</span></div>}
+        <div className="honesty-note"><Icon name="lock" size={15} /><span>{plan.place.source === "geoapify" ? <>Place name and category from <a href={plan.place.mapUrl} target="_blank" rel="noreferrer">Geoapify</a>. I haven’t checked current access, opening times, or routes.</> : plan.place.source === "openstreetmap" ? <>Place name and category from <a href={`https://www.openstreetmap.org/${plan.place.osmType}/${plan.place.osmId}`} target="_blank" rel="noreferrer">OpenStreetMap</a>. I haven’t checked current access, opening times, or routes.</> : "Based on a place you saved. I haven’t checked current access, opening times, or routes."}</span></div>
       </div>
       <div className="suggestion-actions"><button className="button button-primary" onClick={onStart}>Let’s go <Icon name="arrow" /></button><button className="button button-quiet" onClick={onBack}>Maybe another time</button></div>
     </div>
@@ -1148,22 +1380,130 @@ function Suggestion({ plan, onStart, onBack }: { plan: OutingPlan; onStart: () =
 }
 
 function Outing({
-  plan, draft, localVoiceAvailable, onDraftChange, onEnd, onSpeak,
-}: { plan: OutingPlan; draft: SessionDraft; localVoiceAvailable: boolean; onDraftChange: (draft: SessionDraft) => void; onEnd: () => void; onSpeak: (text: string) => void }) {
+  plan, draft, gemmaReady, elevenLabsConfigured, onDraftChange, onConversationChange, onPhotoChange, onEnd, onSpeak, onReply, onUnlockAudio,
+}: { plan: OutingPlan; draft: SessionDraft; gemmaReady: boolean; elevenLabsConfigured: boolean; onDraftChange: (draft: SessionDraft) => void; onConversationChange: (messages: OutingChatMessage[]) => void; onPhotoChange: (photoDataUrl: string | undefined) => void; onEnd: () => void; onSpeak: (text: string) => Promise<void>; onReply: (messages: OutingChatMessage[], plan: OutingPlan) => Promise<string>; onUnlockAudio: () => Promise<void> }) {
   const [paused, setPaused] = useState(false);
   const [cameraStatus, setCameraStatus] = useState<"off" | "starting" | "active" | "paused" | "error">("off");
   const [cameraError, setCameraError] = useState("");
-  const [capturedImage, setCapturedImage] = useState("");
+  const [capturedImage, setCapturedImage] = useState(draft.photoDataUrl ?? "");
   const [momentInput, setMomentInput] = useState("");
-  const [showImageNote, setShowImageNote] = useState(false);
+  const [showImageNote, setShowImageNote] = useState(Boolean(draft.photoDataUrl));
   const [showCameraInfo, setShowCameraInfo] = useState(false);
+  const [voiceConsent, setVoiceConsent] = useState(false);
+  const [voiceMode, setVoiceMode] = useState(false);
+  const [chatInput, setChatInput] = useState("");
+  const [chatStatus, setChatStatus] = useState("");
+  const [turnPending, setTurnPending] = useState(false);
+  const [chatMessages, setChatMessages] = useState<OutingChatMessage[]>(draft.conversation ?? []);
+  const recognitionRef = useRef<BrowserRecognition | null>(null);
+  const voiceModeRef = useRef(false);
+  const processingVoiceRef = useRef(false);
+  const chatMessagesRef = useRef<OutingChatMessage[]>(draft.conversation ?? []);
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
   useEffect(() => () => {
     streamRef.current?.getTracks().forEach((track) => track.stop());
-    if (capturedImage) URL.revokeObjectURL(capturedImage);
-  }, [capturedImage]);
+    voiceModeRef.current = false;
+    recognitionRef.current?.stop();
+  }, []);
+
+  function setMessages(messages: OutingChatMessage[]) {
+    chatMessagesRef.current = messages;
+    setChatMessages(messages);
+  }
+
+  function restartRecognition() {
+    if (!voiceModeRef.current || paused || processingVoiceRef.current) return;
+    try { recognitionRef.current?.start(); } catch { /* The browser may still be completing its previous recognition turn. */ }
+  }
+
+  async function sendToCompanion(rawText: string) {
+    const text = rawText.trim();
+    if (!text || processingVoiceRef.current || paused) return;
+    processingVoiceRef.current = true;
+    setTurnPending(true);
+    recognitionRef.current?.stop();
+    const nextMessages = [...chatMessagesRef.current, { role: "user" as const, content: text }];
+    setMessages(nextMessages);
+    onConversationChange(nextMessages);
+    setChatInput("");
+    setChatStatus("Thinking with Gemma on this device…");
+    try {
+      const reply = await onReply(nextMessages, plan);
+      const withReply = [...nextMessages, { role: "assistant" as const, content: reply }];
+      setMessages(withReply);
+      onConversationChange(withReply);
+      setChatStatus(voiceModeRef.current ? "Replying aloud…" : "Here with you");
+      if (voiceModeRef.current && elevenLabsConfigured) await onSpeak(reply);
+    } catch (error) {
+      setChatStatus(error instanceof Error ? error.message : "Gemma could not reply. Please try again.");
+    } finally {
+      processingVoiceRef.current = false;
+      setTurnPending(false);
+      setChatStatus(voiceModeRef.current ? (elevenLabsConfigured ? "Listening for your next thought…" : "Listening · add ElevenLabs server settings for spoken replies") : "Here with you");
+      restartRecognition();
+    }
+  }
+
+  function startVoiceConversation() {
+    if (!gemmaReady) {
+      setChatStatus("Set up and load Gemma in Settings before starting a live conversation. Typed thoughts can still be saved for the diary.");
+      return;
+    }
+    const speechWindow = window as Window & { SpeechRecognition?: BrowserRecognitionConstructor; webkitSpeechRecognition?: BrowserRecognitionConstructor };
+    const Recognition = speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition;
+    if (!Recognition) {
+      setChatStatus("Live speech recognition is not supported in this browser. You can still type to Gemma.");
+      return;
+    }
+    if (!voiceConsent) {
+      setChatStatus("Please read and accept the speech privacy note before starting the microphone.");
+      return;
+    }
+    void onUnlockAudio().catch(() => undefined);
+    try {
+      const recognition = new Recognition();
+      recognition.continuous = true;
+      recognition.interimResults = false;
+      recognition.lang = navigator.language || "en-US";
+      recognition.onresult = (event) => {
+        const phrases: string[] = [];
+        for (let index = event.resultIndex; index < event.results.length; index += 1) {
+          const result = event.results[index];
+          if (result.isFinal) phrases.push(result[0].transcript);
+        }
+        if (phrases.length) void sendToCompanion(phrases.join(" "));
+      };
+      recognition.onerror = (event) => {
+        if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+          voiceModeRef.current = false;
+          setVoiceMode(false);
+          setChatStatus("Microphone access was denied. Allow it in your browser settings and try again.");
+        } else if (event.error !== "no-speech" && event.error !== "aborted") {
+          setChatStatus(`Speech recognition stopped (${event.error}). You can restart it or type instead.`);
+        }
+      };
+      recognition.onend = () => restartRecognition();
+      recognitionRef.current?.stop();
+      recognitionRef.current = recognition;
+      voiceModeRef.current = true;
+      setVoiceMode(true);
+      setChatStatus("Listening. Your browser may send audio to its speech-recognition provider for transcription.");
+      recognition.start();
+    } catch (error) {
+      voiceModeRef.current = false;
+      setVoiceMode(false);
+      setChatStatus(error instanceof Error ? error.message : "The microphone could not be started.");
+    }
+  }
+
+  function stopVoiceConversation() {
+    voiceModeRef.current = false;
+    setVoiceMode(false);
+    recognitionRef.current?.stop();
+    setChatStatus("Voice chat paused. Your typed conversation is still available.");
+  }
 
   async function startCamera() {
     setCameraStatus("starting");
@@ -1183,6 +1523,7 @@ function Outing({
 
   function togglePause() {
     const nextPaused = !paused;
+    if (nextPaused) stopVoiceConversation();
     setPaused(nextPaused);
     streamRef.current?.getVideoTracks().forEach((track) => { track.enabled = !nextPaused; });
     if (cameraStatus === "active" && nextPaused) setCameraStatus("paused");
@@ -1197,14 +1538,42 @@ function Outing({
 
   function captureFrame() {
     if (!videoRef.current || videoRef.current.videoWidth === 0) return;
+    const source = videoRef.current;
+    const scale = Math.min(1, 1280 / Math.max(source.videoWidth, source.videoHeight));
     const canvas = document.createElement("canvas");
-    canvas.width = videoRef.current.videoWidth;
-    canvas.height = videoRef.current.videoHeight;
+    canvas.width = Math.max(1, Math.round(source.videoWidth * scale));
+    canvas.height = Math.max(1, Math.round(source.videoHeight * scale));
     const context = canvas.getContext("2d");
-    context?.drawImage(videoRef.current, 0, 0);
-    const nextImage = canvas.toDataURL("image/jpeg", 0.82);
-    setCapturedImage(nextImage);
-    setShowImageNote(true);
+    if (!context) {
+      setCameraError("The browser could not prepare this photo for local storage.");
+      return;
+    }
+    context.drawImage(source, 0, 0, canvas.width, canvas.height);
+    canvas.toBlob((blob) => {
+      if (!blob) {
+        setCameraError("The browser could not prepare this photo for local storage.");
+        return;
+      }
+      void attachPhoto(blob);
+    }, "image/jpeg", 0.82);
+  }
+
+  async function attachPhoto(file: Blob) {
+    setCameraError("");
+    try {
+      const photoDataUrl = await prepareDiaryPhoto(file);
+      setCapturedImage(photoDataUrl);
+      setShowImageNote(true);
+      onPhotoChange(photoDataUrl);
+    } catch (error) {
+      setCameraError(error instanceof Error ? error.message : "This image could not be saved locally.");
+    }
+  }
+
+  function forgetPhoto() {
+    setCapturedImage("");
+    setShowImageNote(false);
+    onPhotoChange(undefined);
   }
 
   function addMoment() {
@@ -1229,20 +1598,23 @@ function Outing({
               <div className="camera-controls"><button className="button button-camera" onClick={captureFrame}>Keep a photo for this moment</button><button className="button button-quiet button-small" onClick={stopCamera}>Turn camera off</button></div>
             </div>
           ) : (
-            <div className="camera-placeholder"><div className="camera-placeholder-icon"><Icon name="camera" size={28} /></div><p>Nothing is being viewed until you choose to turn your camera on.</p><button className="button button-secondary button-small" onClick={() => setShowCameraInfo(!showCameraInfo)}>A note before camera access</button>{showCameraInfo && <p className="camera-permission-note">Your browser will ask permission next. The live preview stays in this tab. No photo is saved to your diary unless you choose to keep it, and this demo has no vision model to interpret it.</p>}<button className="button button-primary button-small" onClick={() => { void startCamera(); }}>Turn on camera</button></div>
+            <div className="camera-placeholder"><div className="camera-placeholder-icon"><Icon name="camera" size={28} /></div><p>Nothing is being viewed until you choose to turn your camera on.</p><button className="button button-secondary button-small" onClick={() => setShowCameraInfo(!showCameraInfo)}>A note before camera access</button>{showCameraInfo && <p className="camera-permission-note">Your browser will ask permission next. The live preview stays in this tab. No photo is saved to your diary unless you choose to keep it; optional photo analysis is available later on the diary screen.</p>}<button className="button button-primary button-small" onClick={() => { void startCamera(); }}>Turn on camera</button></div>
           )}
           {cameraError && <p className="form-error" role="alert">{cameraError}</p>}
-          {capturedImage && <div className="captured-preview"><img src={capturedImage} alt="Photo you just captured; currently held only in memory" /><div><strong>A little moment, just for us</strong><span>This image lives only in this tab’s memory, not your diary or local storage.</span>{showImageNote && <label className="toggle-row"><input type="checkbox" checked={draft.moments.some((moment) => moment.startsWith("I took a photo"))} onChange={(event) => { if (event.target.checked) onDraftChange({ ...draft, moments: [...draft.moments, "I took a photo to remember this scene."] }); else onDraftChange({ ...draft, moments: draft.moments.filter((moment) => !moment.startsWith("I took a photo")) }); }} /><span className="custom-checkbox" /><span>Keep a note about this photo in my diary</span></label>}</div></div>}
-          <div className="camera-upload"><label className="text-link upload-label">Or choose an image to describe<input type="file" accept="image/*" onChange={(event) => { const file = event.target.files?.[0]; if (!file) return; if (capturedImage) URL.revokeObjectURL(capturedImage); setCapturedImage(URL.createObjectURL(file)); setShowImageNote(true); }} /></label>{capturedImage && <button className="text-link" onClick={() => { URL.revokeObjectURL(capturedImage); setCapturedImage(""); setShowImageNote(false); }}>Forget image</button>}</div>
+          {capturedImage && <div className="captured-preview"><img src={capturedImage} alt="Image attached to this diary entry" /><div><strong>A little moment, just for us</strong><span>This compressed image is saved in this browser with the entry and is never uploaded. You can optionally ask the local vision model to describe it when writing the diary.</span>{showImageNote && <label className="toggle-row"><input type="checkbox" checked={draft.moments.includes(PHOTO_DIARY_MOMENT)} disabled={!draft.moments.includes(PHOTO_DIARY_MOMENT) && draft.moments.length >= 3} onChange={(event) => { if (event.target.checked) onDraftChange({ ...draft, moments: [...draft.moments, PHOTO_DIARY_MOMENT] }); else onDraftChange({ ...draft, moments: draft.moments.filter((moment) => moment !== PHOTO_DIARY_MOMENT) }); }} /><span className="custom-checkbox" /><span>Add a note that a photo is attached</span></label>}</div></div>}
+          <div className="camera-upload"><label className="text-link upload-label">Attach a photo to this diary entry<input type="file" accept="image/*" onChange={(event) => { const file = event.target.files?.[0]; if (file) void attachPhoto(file); }} /></label>{capturedImage && <button className="text-link" onClick={forgetPhoto}>Forget image</button>}</div>
         </section>
 
         <section className="media-card voice-card">
-          <div className="media-card-heading"><span className="media-icon"><Icon name="heart" /></span><div><strong>A little conversation</strong><span>Typed chat · your notes stay on this device</span></div></div>
-          <div className="companion-message"><div className="companion-avatar">w.</div><div><p>We made it here. What’s caught your eye so far?</p><span>YOUR COMPANION</span></div></div>
-          <label className="field-label">A thought to share<textarea value={draft.notes} disabled={paused} onChange={(event) => onDraftChange({ ...draft, notes: event.target.value })} placeholder="Type a thought, a detail, or what happened…" rows={3} /></label>
+          <div className="media-card-heading"><span className="media-icon"><Icon name="heart" /></span><div><strong>A little conversation</strong><span>{voiceMode ? "Voice chat is on · Gemma replies locally" : "Talk or type · Gemma replies locally"}</span></div><span className={`media-indicator ${voiceMode ? "media-indicator-on" : ""}`} /></div>
+          <div className="companion-message"><div className="companion-avatar">w.</div><div><p>{chatMessages.length ? "I’m following along. What else is on your mind?" : "We made it here. What’s caught your eye so far?"}</p><span>YOUR COMPANION</span></div></div>
+          {chatMessages.length > 0 && <div className="conversation-log" aria-live="polite">{chatMessages.slice(-6).map((message, index) => <div className={`conversation-line ${message.role === "user" ? "conversation-user" : "conversation-ai"}`} key={`${index}-${message.content.slice(0, 24)}`}><span>{message.role === "user" ? "YOU" : "GEMMA"}</span><p>{message.content}</p></div>)}</div>}
+          <label className="field-label">A thought to share<textarea value={chatInput} disabled={paused || processingVoiceRef.current} onChange={(event) => setChatInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && chatInput.trim()) { event.preventDefault(); void sendToCompanion(chatInput); } }} placeholder="Talk to me about what’s on your mind…" rows={2} /></label>
+          <div className="voice-actions"><button type="button" className="button button-primary button-small" disabled={!chatInput.trim() || paused || processingVoiceRef.current} onClick={() => { void sendToCompanion(chatInput); }}>Send to Gemma <Icon name="arrow" size={15} /></button><button className="button button-secondary button-small" disabled={!draft.notes.trim() || paused || !elevenLabsConfigured} onClick={() => { stopVoiceConversation(); void onSpeak(draft.notes); }}><span aria-hidden="true">◖)))</span> Read my note aloud</button></div>
+          <label className="speech-consent"><input type="checkbox" checked={voiceConsent} disabled={voiceMode} onChange={(event) => setVoiceConsent(event.target.checked)} /><span>I understand my browser may send microphone audio to its speech-recognition provider. Transcribed words go to Gemma locally; spoken AI replies are sent to ElevenLabs.</span></label>
+          <div className="voice-actions voice-session-actions">{voiceMode ? <button type="button" className="button button-secondary button-small" onClick={stopVoiceConversation}>Stop listening</button> : <button type="button" className="button button-secondary button-small" disabled={paused} onClick={startVoiceConversation}><span aria-hidden="true">🎙</span> Start voice chat</button>}<span>{elevenLabsConfigured ? "ElevenLabs voice: narrative and friendly." : "Voice is set up after the server gets an ElevenLabs API key and voice ID."}</span></div>
+          {chatStatus && <p className="voice-status" role="status" aria-live="polite">{chatStatus}</p>}
           <label className="field-label">A feeling you’d like me to remember <span className="optional-label">OPTIONAL</span><input value={draft.mood} disabled={paused} onChange={(event) => onDraftChange({ ...draft, mood: event.target.value })} placeholder="Only if you want to share how you feel" /></label>
-          <div className="voice-actions"><button className="button button-secondary button-small" disabled={!draft.notes.trim() || paused || !localVoiceAvailable} onClick={() => onSpeak(draft.notes)}><span aria-hidden="true">◖)))</span> Read my note aloud</button><span>{localVoiceAvailable ? "Uses a voice marked local by your browser." : "No locally installed speech voice was detected."}</span></div>
-          <div className="typed-fallback-note"><Icon name="lock" size={14} /><span>No local speech-recognition model is configured. Use typed notes instead of sending audio to a browser speech service.</span></div>
         </section>
       </div>
       <section className="moment-capture">
@@ -1250,7 +1622,7 @@ function Outing({
         <div className="moment-input-row"><input value={momentInput} disabled={paused || draft.moments.length >= 3} onChange={(event) => setMomentInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addMoment(); } }} placeholder={draft.moments.length >= 3 ? "Three moments saved" : "Something you’d like to remember…"} /><button className="button button-secondary button-small" disabled={!momentInput.trim() || paused || draft.moments.length >= 3} onClick={addMoment}><Icon name="plus" size={16} /> Keep this</button></div>
         {draft.moments.length > 0 && <div className="moment-list">{draft.moments.map((moment, index) => <div key={`${moment}-${index}`}><span>{index + 1}</span><p>{moment}</p><button aria-label={`Remove saved moment: ${moment}`} onClick={() => onDraftChange({ ...draft, moments: draft.moments.filter((_, itemIndex) => itemIndex !== index) })}>×</button></div>)}</div>}
       </section>
-      <div className="outing-footer"><div className="outing-status-note"><span className={`status-dot ${paused ? "" : "status-dot-green"}`} />{paused ? "Your outing is paused" : "All notes are saved locally, as you go"}</div><div className="outing-controls"><button className="button button-quiet" onClick={togglePause}>{paused ? "Keep going" : "Take a pause"}</button><button className="button button-primary" onClick={() => { stopCamera(); onEnd(); }}>Wrap up our day <Icon name="arrow" /></button></div></div>
+      <div className="outing-footer"><div className="outing-status-note"><span className={`status-dot ${paused ? "" : "status-dot-green"}`} />{turnPending ? "Saving the current AI conversation turn…" : paused ? "Your outing is paused" : "All notes are saved locally, as you go"}</div><div className="outing-controls"><button className="button button-quiet" onClick={togglePause}>{paused ? "Keep going" : "Take a pause"}</button><button className="button button-primary" disabled={turnPending} onClick={() => { stopCamera(); onEnd(); }}>{turnPending ? "Finishing conversation…" : "Wrap up our day"} {!turnPending && <Icon name="arrow" />}</button></div></div>
     </div>
   );
 }
@@ -1274,24 +1646,30 @@ function WrapUp({
   onBack: () => void;
   onSetupGemma: () => Promise<void>;
   onForgetGemma: () => Promise<void>;
-  onGenerate: (plan: DiaryPlan, draft: DiaryDraft) => Promise<string>;
+  onGenerate: (plan: DiaryPlan, draft: DiaryDraft, options?: { analyzePhoto?: boolean; onProgress?: (message: string) => void }) => Promise<string>;
 }) {
   const [generatedStory, setGeneratedStory] = useState("");
   const [generating, setGenerating] = useState(false);
   const [generationError, setGenerationError] = useState("");
+  const [analyzePhoto, setAnalyzePhoto] = useState(false);
+  const [generationStatus, setGenerationStatus] = useState("");
   const preview = makeDiary(plan, draft, generatedStory || undefined);
   const [momentInput, setMomentInput] = useState("");
 
   useEffect(() => {
     setGeneratedStory("");
     setGenerationError("");
-  }, [draft.notes, draft.mood, draft.moments]);
+  }, [draft.notes, draft.mood, draft.moments, draft.conversation, draft.photoDataUrl, analyzePhoto]);
 
   async function generateStory() {
     setGenerating(true);
     setGenerationError("");
+    setGenerationStatus("Starting Gemma on this device…");
     try {
-      setGeneratedStory(await onGenerate(plan, draft));
+      setGeneratedStory(await onGenerate(plan, draft, {
+        analyzePhoto: Boolean(draft.photoDataUrl && analyzePhoto),
+        onProgress: setGenerationStatus,
+      }));
     } catch (error) {
       setGenerationError(error instanceof Error ? error.message : "Gemma couldn’t write this entry.");
     } finally {
@@ -1302,14 +1680,15 @@ function WrapUp({
   return (
     <div className="wrapup-layout">
       <button className="back-link" onClick={onBack}><Icon name="back" size={17} /> Back to our outing</button>
-      <div className="wrapup-heading"><p className="eyebrow">TAKE A LITTLE OF TODAY WITH YOU</p><h1>What should I remember?</h1><p className="lead">Tell me what happened in whatever words come. I’ll use that as material for a page of my own, not a transcript of yours.</p></div>
-      {gemmaStatus.phase === "ready" ? (
+      <div className="wrapup-heading"><p className="eyebrow">TAKE A LITTLE OF TODAY WITH YOU</p><h1>What should I remember?</h1><p className="lead">Gemma will consider the whole conversation from our outing, along with anything you add here, and turn it into a diary page rather than a transcript.</p></div>
+      {gemmaStatus.phase === "ready" || generating ? (
         <section className="gemma-write-card">
-          <div><strong>Write with Gemma on this device</strong><p>Only compact fact cues—not your original sentences—are sent to the local model.</p></div>
+          <div><strong>Write with Gemma on this device</strong><p>Gemma reads the full outing chat log and your wrap-up notes locally, then writes from them without copying the conversation into your diary.</p></div>
           <button type="button" className="button button-secondary" disabled={generating} onClick={() => { void generateStory(); }}>
             {generating ? "Writing on this device…" : generatedStory ? "Try another version" : "Write with Gemma"}
           </button>
-          {generating && <p className="gemma-generation-status" role="status">The first response can take a little while as the GPU warms up. Your notes are not sent to a server.</p>}
+          {draft.photoDataUrl && <label className="photo-analysis-choice"><input type="checkbox" checked={analyzePhoto} disabled={generating} onChange={(event) => setAnalyzePhoto(event.target.checked)} /><span><strong>Let the local AI look at this photo</strong><small>Optional. Downloads an additional {PHOTO_VISION_MODEL_SIZE} vision model and needs about {PHOTO_VISION_REQUIRED_GPU_MEMORY_MB} MB of GPU memory. The model runs on this device; no image is uploaded.</small></span></label>}
+          {generating && <p className="gemma-generation-status" role="status">{generationStatus || "The first response can take a little while as the GPU warms up."} Your notes and image stay on this device.</p>}
           {generationError && <p className="form-error" role="alert">{generationError}</p>}
         </section>
       ) : (
@@ -1330,7 +1709,7 @@ function WrapUp({
           </div>
           <button className="button button-primary button-full" disabled={generating} onClick={() => onSave(draft, generatedStory || undefined)}>Save this little story <Icon name="arrow" /></button>
         </div>
-        <aside className="diary-preview-card"><div className="preview-label"><Icon name="book" size={16} /> A FIRST LOOK AT OUR DIARY</div><h2>A day at {plan.place.name}</h2><p className="preview-date">{new Date().toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })} <span>·</span> {plan.locality}</p><div className="preview-rule" /><p className="preview-story">{preview.story}</p><span className="preview-note">{generatedStory ? "Written by Gemma 2 2B locally on this device from compact fact cues; your original notes were not sent to the model." : "Local creative-composition fallback. It does not use an LLM; saved moments stay in your words."}</span></aside>
+        <aside className="diary-preview-card"><div className="preview-label"><Icon name="book" size={16} /> A FIRST LOOK AT OUR DIARY</div><h2>A day at {plan.place.name}</h2><p className="preview-date">{new Date().toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })} <span>·</span> {plan.locality}</p><div className="preview-rule" />{draft.photoDataUrl && <img className="diary-preview-photo" src={draft.photoDataUrl} alt="Photo attached to this diary entry" />}<p className="preview-story">{preview.story}</p><span className="preview-note">{generatedStory ? `Written by Gemma 2 2B locally from compact fact cues${analyzePhoto && draft.photoDataUrl ? " and optional on-device photo observations" : ""}; notes and photos stay on this device.` : "Local fallback; no LLM. It uses only the notes and moments you provided."}</span></aside>
       </div>
     </div>
   );
@@ -1343,23 +1722,25 @@ function DiaryLibrary({ entries, onOpen, onCreate }: { entries: DiaryEntry[]; on
       {entries.length === 0 ? (
         <div className="empty-diary"><div className="empty-book"><Icon name="book" size={31} /></div><p className="eyebrow">A BLANK PAGE, FOR NOW</p><h2>Every little adventure has a first page.</h2><p>When we come back from our first outing, our story will be waiting here — written from the things you chose to share.</p><button className="button button-primary" onClick={onCreate}>Let’s plan a little day <Icon name="arrow" /></button></div>
       ) : (
-        <div className="diary-grid">{entries.map((entry, index) => <button key={entry.id} className={`diary-card diary-card-${index % 3}`} onClick={() => onOpen(entry)}><div className="diary-card-date">{new Date(entry.createdAt).toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric" })}<span className="diary-card-icon"><Icon name="book" size={17} /></span></div><h2>{entry.placeName}</h2><p className="diary-card-area"><Icon name="pin" size={14} /> {entry.locality}</p><p className="diary-card-excerpt">{entry.story.slice(0, 190)}{entry.story.length > 190 ? "…" : ""}</p>{entry.moments.length > 0 && <div className="diary-card-moment"><Icon name="heart" size={14} /><span>{entry.moments[0]}</span></div>}<span className="diary-card-open">Read our story <Icon name="arrow" size={15} /></span></button>)}</div>
+        <div className="diary-grid">{entries.map((entry, index) => <button key={entry.id} className={`diary-card diary-card-${index % 3}`} onClick={() => onOpen(entry)}><div className="diary-card-date">{new Date(entry.createdAt).toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric" })}<span className="diary-card-icon"><Icon name="book" size={17} /></span></div>{entry.photoDataUrl && <img className="diary-card-photo" src={entry.photoDataUrl} alt="" />}<h2>{entry.placeName}</h2><p className="diary-card-area"><Icon name="pin" size={14} /> {entry.locality}</p><p className="diary-card-excerpt">{entry.story.slice(0, 190)}{entry.story.length > 190 ? "…" : ""}</p>{entry.moments.length > 0 && <div className="diary-card-moment"><Icon name="heart" size={14} /><span>{entry.moments[0]}</span></div>}<span className="diary-card-open">Read our story <Icon name="arrow" size={15} /></span></button>)}</div>
       )}
       <div className="library-footnote"><Icon name="lock" size={14} /><span>Saved in this browser. No account, no cloud sync.</span></div>
     </div>
   );
 }
 
-function DiaryView({ entry, onBack, onDelete }: { entry: DiaryEntry; onBack: () => void; onDelete: () => void }) {
+function DiaryView({ entry, elevenLabsConfigured, onSpeak, onBack, onDelete }: { entry: DiaryEntry; elevenLabsConfigured: boolean; onSpeak: (text: string) => Promise<void>; onBack: () => void; onDelete: () => void }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   return (
     <article className="diary-entry-view">
       <button className="back-link" onClick={onBack}><Icon name="back" size={17} /> Back to your diary</button>
       <header className="entry-header"><p className="eyebrow">{new Date(entry.createdAt).toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" })} · {entry.locality.toUpperCase()}</p><h1>A day at {entry.placeName}<span className="title-period">.</span></h1><div className="entry-decoration"><span /><Icon name="heart" /><span /></div></header>
+      {entry.photoDataUrl && <figure className="entry-photo"><img src={entry.photoDataUrl} alt="Photo attached to this diary entry" /><figcaption>Saved with this entry in this browser only.</figcaption></figure>}
       <div className="entry-story">{entry.story.split("\n\n").map((paragraph, index) => <p className={index === 0 ? "entry-first-paragraph" : ""} key={`${index}-${paragraph}`}>{paragraph}</p>)}</div>
+      <div className="entry-read-aloud"><button className="button button-secondary button-small" disabled={!elevenLabsConfigured} onClick={() => { void onSpeak(entry.story); }}><span aria-hidden="true">◖)))</span> Read the diary out</button><span>{elevenLabsConfigured ? "Narrative, friendly ElevenLabs voice. This entry’s text is sent to ElevenLabs when you press play." : "Add the ElevenLabs API key and voice ID to the application server to enable read-aloud."}</span></div>
       {entry.moments.length > 0 && <section className="entry-moments"><p className="eyebrow">KEEPS, IN MY HANDWRITING</p>{entry.moments.map((moment, index) => <div className="entry-moment" key={`${moment}-${index}`}><span>0{index + 1}</span><p>{moment}</p><Icon name="heart" size={16} /></div>)}</section>}
       <div className="entry-actions"><button className="button button-quiet button-small" onClick={() => setConfirmDelete(!confirmDelete)}>Delete this story</button>{confirmDelete && <div className="delete-confirm"><span>Remove this diary entry from this browser?</span><button className="text-link danger-link" onClick={onDelete}>Yes, delete it</button><button className="text-link" onClick={() => setConfirmDelete(false)}>Keep it</button></div>}</div>
-      <p className="entry-colophon">A locally composed page. Your replies were used as material, not as wording to paste.</p>
+      <p className="entry-colophon">Saved in this browser. Attached photos stay here and are never uploaded.</p>
     </article>
   );
 }
@@ -1437,7 +1818,7 @@ function GemmaModelCard({
 
 function Settings({
   data,
-  localVoiceAvailable,
+  elevenLabsConfigured,
   gemmaStatus,
   onSetupGemma,
   onForgetGemma,
@@ -1445,7 +1826,7 @@ function Settings({
   onDeleteAll,
 }: {
   data: AppData;
-  localVoiceAvailable: boolean;
+  elevenLabsConfigured: boolean;
   gemmaStatus: GemmaStatus;
   onSetupGemma: () => Promise<void>;
   onForgetGemma: () => Promise<void>;
@@ -1454,9 +1835,6 @@ function Settings({
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [exportError, setExportError] = useState("");
-  const cameraSupported = Boolean(navigator.mediaDevices?.getUserMedia);
-  const speechSynthesisSupported = "speechSynthesis" in window;
-
   function exportWithError() {
     try {
       onExport();
@@ -1470,11 +1848,11 @@ function Settings({
     <div className="settings-layout">
       <div className="settings-heading"><p className="eyebrow">YOUR DEVICE, YOUR CHOICES</p><h1>Your space,<br /><em>your rules.</em></h1><p className="lead">A few notes on what stays here, and what this demo can do.</p></div>
       <GemmaModelCard status={gemmaStatus} onSetup={onSetupGemma} onForget={onForgetGemma} />
-      <section className="settings-card"><div className="settings-card-title"><div className="settings-icon"><Icon name="lock" /></div><div><h2>Your local data</h2><p>Stories, preferences and saved places live in this browser’s local storage. This app does not encrypt that data. Coordinates are not saved. When you request a nearby search, coordinates rounded to about 100 m and your interest terms go to the application server, which forwards a fixed, interest-filtered query to OpenStreetMap Overpass; both services receive the location query and ordinary network metadata. Typed-area search also sends the area text to OpenStreetMap Nominatim to find an approximate centre. The application server does not store search coordinates.</p></div></div><div className="data-tally"><span>{data.entries.length} diary entr{data.entries.length === 1 ? "y" : "ies"}</span><span>{data.places.length} saved place{data.places.length === 1 ? "" : "s"}</span></div><button className="button button-secondary" onClick={exportWithError}><Icon name="download" size={17} /> Export my data</button>{exportError && <p className="form-error" role="alert">{exportError}</p>}</section>
-      <section className="settings-card"><div className="settings-card-title"><div className="settings-icon"><Icon name="sun" /></div><div><h2>Browser & model capabilities</h2><p>Gemma availability is checked for this browser and GPU. Diary generation uses Gemma only after you accept its terms and set up the model; otherwise the local composition remains available as a clearly labelled fallback.</p></div></div><div className="capability-list"><Capability label="No hosted AI or analytics" detail="No diary prompts or content are sent to an inference service." active /><Capability label="Typed notes and local diary" detail="Works in modern browsers with local storage." active /><Capability label="GPS, manual map-point or typed-area place search" detail="On request only: coordinates or the typed area go to OpenStreetMap services. GPS requires permission; searches need internet." active /><Capability label="On-device image recognition" detail="Not available; describe an image in your own words." /><Capability label="Local speech-to-text model" detail="Not configured; browser speech recognition is intentionally not used." /><Capability label="Browser camera preview" detail={cameraSupported ? "Available on localhost or HTTPS after you explicitly allow it." : "This browser does not expose the camera API."} active={cameraSupported} /><Capability label="Installed, local text-to-speech voice" detail={!speechSynthesisSupported ? "Speech synthesis is not available." : localVoiceAvailable ? "A local voice is installed; the app uses only voices reported as local." : "No locally installed speech voice was detected."} active={localVoiceAvailable} /></div></section>
-      <section className="settings-card"><div className="settings-card-title"><div className="settings-icon"><Icon name="camera" /></div><div><h2>Camera & microphone</h2><p>The browser asks before the camera is used; the preview is local and no photo is kept by default. This version doesn’t activate a microphone because there is no trustworthy local speech-recognition model installed.</p></div></div></section>
+      <section className="settings-card"><div className="settings-card-title"><div className="settings-icon"><Icon name="lock" /></div><div><h2>Your local data</h2><p>Stories, preferences, saved places, draft notes, and attached diary photos live in this browser’s local storage. Photos are resized and kept on this device; this app does not encrypt local data or upload photos. If you opt in to image analysis while writing, the attached image is processed locally and its short visual description is used by Gemma. Coordinates are not saved. When you request a nearby search, coordinates rounded to about 100 m and broad place categories go to the application server, which searches OpenStreetMap Overpass and may use Geoapify Places if Overpass fails or returns no places; the answering provider receives the approximate location and ordinary network metadata. Your full mood text stays in this browser for local Gemma ranking. Typed-area search also sends the area text to OpenStreetMap Nominatim to find an approximate centre. The application server does not store search coordinates.</p></div></div><div className="data-tally"><span>{data.entries.length} diary entr{data.entries.length === 1 ? "y" : "ies"}</span><span>{data.places.length} saved place{data.places.length === 1 ? "" : "s"}</span></div><button className="button button-secondary" onClick={exportWithError}><Icon name="download" size={17} /> Export my data</button>{exportError && <p className="form-error" role="alert">{exportError}</p>}</section>
+      <section className="settings-card"><div className="settings-card-title"><div className="settings-icon"><Icon name="sun" /></div><div><h2>Voice companion & speech</h2><p>Browser speech recognition transcribes only while you start voice chat and may send microphone audio to the browser vendor’s service. User speech is passed to local Gemma. If configured, the spoken reply and any diary entry you choose to read aloud are sent to ElevenLabs for voice generation. You choose when to start listening and when to read an entry.</p></div></div><div className="capability-list"><Capability label="Local Gemma conversation" detail="Voice chat requires the Gemma model to be set up and loaded in this browser." active={gemmaStatus.phase === "ready"} /><Capability label="ElevenLabs text-to-speech" detail={elevenLabsConfigured ? "Configured. Voice replies and diary read-aloud use your selected voice." : "Not configured. Set ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID on the server, then restart it."} active={elevenLabsConfigured} /><Capability label="On-demand browser speech recognition" detail="Available only in browsers with SpeechRecognition/WebKit SpeechRecognition and after you accept the disclosure and grant microphone permission." /></div></section>
+      <section className="settings-card"><div className="settings-card-title"><div className="settings-icon"><Icon name="camera" /></div><div><h2>Camera</h2><p>The browser asks before the camera is used; the preview is local and a photo is saved only when you choose to attach it to a diary entry. Photos are never uploaded; optional image analysis uses a separate local vision model only after you opt in on the diary screen.</p></div></div></section>
       <section className="settings-card settings-delete"><div className="settings-card-title"><div className="settings-icon"><span>×</span></div><div><h2>Start fresh</h2><p>Delete your profile, places, notes, and every diary entry from this browser.</p></div></div>{!confirmDelete ? <button className="button button-danger-outline" onClick={() => setConfirmDelete(true)}>Delete all my data</button> : <div className="delete-confirm"><span>This can’t be undone.</span><button className="button button-danger" onClick={onDeleteAll}>Delete everything</button><button className="button button-quiet" onClick={() => setConfirmDelete(false)}>Keep my data</button></div>}</section>
-      <div className="settings-offline-note"><span className="status-dot status-dot-green" />The app shell is cached locally after your first visit. No remote fonts, analytics, or hosted AI. GPS, manual map-point, and typed-area searches need a network connection and send location queries through the application server to OpenStreetMap.</div>
+      <div className="settings-offline-note"><span className="status-dot status-dot-green" />The app shell is cached locally after your first visit. Diary writing and conversation use local Gemma. Optional speech recognition may use your browser’s provider, and requested speech uses ElevenLabs. GPS, manual map-point, and typed-area searches need a network connection and send location queries through the application server to OpenStreetMap, with Geoapify as an optional fallback.</div>
     </div>
   );
 }

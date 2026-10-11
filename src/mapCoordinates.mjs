@@ -10,7 +10,15 @@ export function parseMapCoordinates(value) {
       const latitude = url.searchParams.get("mlat");
       const longitude = url.searchParams.get("mlon");
       if (latitude && longitude) match = [text, latitude, longitude];
-      else match = url.hash.match(/#map=\d+(?:\.\d+)?\/(-?\d+(?:\.\d+)?)\/(-?\d+(?:\.\d+)?)/);
+      else {
+        match = url.hash.match(/#map=\d+(?:\.\d+)?\/(-?\d+(?:\.\d+)?)\/(-?\d+(?:\.\d+)?)/) ??
+          `${url.pathname}${url.hash}`.match(/@(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)/) ??
+          `${url.pathname}${url.hash}`.match(/!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)/);
+        if (!match) {
+          const coordinates = url.searchParams.get("q") ?? url.searchParams.get("query") ?? url.searchParams.get("ll") ?? url.searchParams.get("center");
+          match = coordinates?.match(/^\s*(-?\d{1,3}(?:\.\d+)?)\s*[, ]\s*(-?\d{1,3}(?:\.\d+)?)\s*$/) ?? null;
+        }
+      }
     } catch {
       return null;
     }

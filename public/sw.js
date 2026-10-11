@@ -1,4 +1,4 @@
-const CACHE_NAME = "wayfarer-shell-v18";
+const CACHE_NAME = "wayfarer-shell-v19";
 const APP_SHELL = ["/", "/index.html", "/manifest.webmanifest"];
 
 self.addEventListener("install", (event) => {
@@ -30,6 +30,7 @@ self.addEventListener("fetch", (event) => {
   if (
     event.request.method !== "GET" ||
     url.origin !== self.location.origin ||
+    url.pathname.startsWith("/api/") ||
     url.pathname.startsWith("/@vite/") ||
     url.pathname.startsWith("/@react-refresh") ||
     url.pathname.startsWith("/@id/") ||

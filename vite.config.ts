@@ -1,6 +1,7 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { createOverpassHandler } from "./server/overpass.mjs";
+import { createElevenLabsHandler } from "./server/elevenlabs.mjs";
 
 export default defineConfig({
   plugins: [
@@ -9,8 +10,9 @@ export default defineConfig({
       name: "wayfarer-nearby-api",
       configureServer(server) {
         const handleOverpassRequest = createOverpassHandler();
+        const handleElevenLabsRequest = createElevenLabsHandler();
         server.middlewares.use((request, response, next) => {
-          void handleOverpassRequest(request, response).then((handled) => {
+          void (async () => await handleElevenLabsRequest(request, response) || await handleOverpassRequest(request, response))().then((handled) => {
             if (!handled) next();
           }, next);
         });
