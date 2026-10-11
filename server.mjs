@@ -88,5 +88,5 @@ const server = createServer(async (request, response) => {
 const port = Number(process.env.PORT ?? 3000);
 const host = process.env.HOST ?? "0.0.0.0";
 server.listen(port, host, () => {
-  console.log(`Wayfarer listening on http://${host}:${port}`);
+  console.log(`Daymark listening on http://${host}:${port}`);
 });

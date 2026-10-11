@@ -21,7 +21,7 @@ const validInput = {
   interests: "adventure",
   refinement: "",
 };
-const TEST_USER_AGENT = "Wayfarer test client (tests only)";
+const TEST_USER_AGENT = "Daymark test client (tests only)";
 
 test("parses OpenStreetMap map-centre hash links", () => {
   assert.deepEqual(
@@ -146,7 +146,7 @@ test("uses the repository URL in its default Overpass User-Agent", async (t) => 
   const response = await postNearby(server);
   assert.equal(response.status, 200);
   assert.equal(sentUserAgent, DEFAULT_OVERPASS_USER_AGENT);
-  assert.match(sentUserAgent, /^Wayfarer\/1\.0 \(\+https:\/\/github\.com\/moisturizedpotato\/Adventure-Companion\)$/);
+  assert.match(sentUserAgent, /^Daymark\/1\.0 \(\+https:\/\/github\.com\/moisturizedpotato\/Adventure-Companion\)$/);
 });
 
 test("rejects an invalid explicit Overpass User-Agent before making a request", async (t) => {

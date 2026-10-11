@@ -1,6 +1,6 @@
 {
-  "name": "Wayfarer Outing Companion",
-  "short_name": "Wayfarer",
+  "name": "Daymark — Outings & Diary",
+  "short_name": "Daymark",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#f7f6f1",

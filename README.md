@@ -1,4 +1,4 @@
-# Wayfarer
+# Daymark
 
 A client-side outing companion prototype built with React, TypeScript, and Vite, with a small Node.js server for nearby-place searches and an optional, user-triggered ElevenLabs speech proxy. There is no account, hosted diary model, analytics, external font, or database. Diary generation and conversation responses run locally; optional speech recognition may use the browser's transcription service, and requested TTS text goes to ElevenLabs. Place discovery is an explicit exception to fully local operation: after the user chooses GPS, manually selected map-point, or typed-area search, approximate coordinates and interest terms are sent to the application server, which constructs a fixed-scope query to OpenStreetMap Overpass. Typed-area search also sends the entered area text directly to OpenStreetMap Nominatim to resolve an approximate centre.
 
@@ -26,7 +26,7 @@ The server listens on `0.0.0.0` and uses the platform-provided `PORT` environmen
 
 ### Overpass client identification
 
-Nearby search identifies itself with `Wayfarer/1.0 (+https://github.com/moisturizedpotato/Adventure-Companion)`. To use another truthful identifier, set `OVERPASS_USER_AGENT` in the environment of the Node.js server (including the Vite process during local development); include the real project URL or contact information and do not use fabricated details. Keep this configuration on the server and restart the process after changing it.
+Nearby search identifies itself with `Daymark/1.0 (+https://github.com/moisturizedpotato/Adventure-Companion)`. To use another truthful identifier, set `OVERPASS_USER_AGENT` in the environment of the Node.js server (including the Vite process during local development); include the real project URL or contact information and do not use fabricated details. Keep this configuration on the server and restart the process after changing it.
 
 If the override is invalid, nearby search returns a clear `configuration_required` error without contacting an Overpass instance. The same actionable error is returned if an instance indicates that the configured identification needs attention. Search can still continue through the app's saved/manual-place fallback.
 

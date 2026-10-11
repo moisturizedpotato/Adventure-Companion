@@ -8,7 +8,7 @@ export const OVERPASS_ENDPOINTS = Object.freeze([
   "https://overpass.kumi.systems/api/interpreter",
 ]);
 export const DEFAULT_OVERPASS_USER_AGENT =
-  "Wayfarer/1.0 (+https://github.com/moisturizedpotato/Adventure-Companion)";
+  "Daymark/1.0 (+https://github.com/moisturizedpotato/Adventure-Companion)";
 
 const MAX_REQUEST_BYTES = 16 * 1024;
 const MAX_RESPONSE_BYTES = 3 * 1024 * 1024;
@@ -102,7 +102,7 @@ function configuredUserAgent(value = process.env.OVERPASS_USER_AGENT ?? DEFAULT_
     throw new NearbyApiError(
       503,
       "configuration_required",
-      "Nearby search is not configured. Set OVERPASS_USER_AGENT to a truthful Wayfarer identifier that includes the real project URL or contact information.",
+      "Nearby search is not configured. Set OVERPASS_USER_AGENT to a truthful Daymark identifier that includes the real project URL or contact information.",
     );
   }
   return value.trim();

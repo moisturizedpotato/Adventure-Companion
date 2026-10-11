@@ -1,4 +1,4 @@
-const CACHE_NAME = "wayfarer-shell-v19";
+const CACHE_NAME = "daymark-shell-v20";
 const APP_SHELL = ["/", "/index.html", "/manifest.webmanifest"];
 
 self.addEventListener("install", (event) => {

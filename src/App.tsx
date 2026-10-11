@@ -96,6 +96,7 @@ type AppData = {
 };
 
 type Screen = "onboarding" | "home" | "suggestion" | "outing" | "wrap-up" | "diary" | "entry" | "settings";
+type Theme = "light" | "dark";
 type GemmaPhase = "checking" | "unsupported" | "available" | "loading" | "ready" | "forgetting" | "error";
 type GemmaStatus = { phase: GemmaPhase; message: string; progress: number };
 type BrowserRecognition = {
@@ -388,10 +389,22 @@ function Icon({ name, size = 19 }: { name: string; size?: number }) {
     lock: "M5 10h14v11H5V10Zm3 0V7a4 4 0 1 1 8 0v3m-4 5v2",
     camera: "M4 7h3l2-3h6l2 3h3v13H4V7Zm8 3a4 4 0 1 0 0 8 4 4 0 0 0 0-8Z",
     download: "M12 3v12m-5-5 5 5 5-5M5 17v4h14v-4",
+    moon: "M20.8 13.1A8.5 8.5 0 0 1 10.9 3.2 8.6 8.6 0 1 0 20.8 13.1Z",
   };
   return (
     <svg aria-hidden="true" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
       <path d={paths[name] ?? paths.sun} />
+    </svg>
+  );
+}
+
+function DaymarkMark({ size = 34 }: { size?: number }) {
+  return (
+    <svg className="daymark-symbol" aria-hidden="true" width={size} height={size} viewBox="0 0 40 40" fill="none">
+      <rect width="40" height="40" rx="13" fill="currentColor" />
+      <path d="M9 23.5h22M12 27.5c2.5-2 5.15-3 8-3s5.5 1 8 3M13 22a7 7 0 0 1 14 0" stroke="var(--logo-paper)" strokeWidth="1.8" strokeLinecap="round" />
+      <circle cx="20" cy="16.5" r="3.2" fill="var(--logo-sun)" />
+      <path d="M11 31h18" stroke="var(--logo-paper)" strokeWidth="1.8" strokeLinecap="round" opacity=".72" />
     </svg>
   );
 }
@@ -403,11 +416,21 @@ export default function App() {
   const [selectedEntryId, setSelectedEntryId] = useState("");
   const [storageError, setStorageError] = useState(initial.error);
   const [online, setOnline] = useState(navigator.onLine);
+  const [theme, setTheme] = useState<Theme>(() => {
+    try { return localStorage.getItem("daymark.theme") === "dark" ? "dark" : "light"; }
+    catch { return "light"; }
+  });
   const [elevenLabsConfigured, setElevenLabsConfigured] = useState(false);
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const [gemmaStatus, setGemmaStatus] = useState<GemmaStatus>({ phase: "checking", message: "Checking this browser for local Gemma support…", progress: 0 });
   const [toast, setToast] = useState("");
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    document.querySelector('meta[name="theme-color"]')?.setAttribute("content", theme === "dark" ? "#14191d" : "#f7f6f1");
+    try { localStorage.setItem("daymark.theme", theme); } catch { /* Theme remains active for this tab. */ }
+  }, [theme]);
 
   async function setupGemma() {
     const compatibility = await checkGemmaCompatibility();
@@ -638,7 +661,7 @@ export default function App() {
     const url = URL.createObjectURL(file);
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = "wayfarer-my-local-data.json";
+    anchor.download = "daymark-my-local-data.json";
     anchor.click();
     URL.revokeObjectURL(url);
   }
@@ -669,7 +692,7 @@ export default function App() {
 
   const title: Record<Screen, string> = {
     onboarding: "A companion for going out",
-    home: "Your next little adventure",
+    home: "A day worth marking",
     suggestion: "A plan that feels like you",
     outing: "Out here, together",
     "wrap-up": "A few things to remember",
@@ -679,11 +702,11 @@ export default function App() {
   };
 
   return (
-    <div className="app-frame">
+    <div className="app-frame" data-theme={theme}>
       <aside className="sidebar">
-        <button className="brand" onClick={() => setScreen("home")} aria-label="Wayfarer home">
-          <span className="brand-mark"><Icon name="sun" size={22} /></span>
-          <span>wayfarer<span className="brand-period">.</span></span>
+        <button className="brand" onClick={() => setScreen("home")} aria-label="Daymark home">
+          <span className="brand-mark"><DaymarkMark size={38} /></span>
+          <span>daymark<span className="brand-period">.</span></span>
         </button>
         <div className="sidebar-note">A little more wonder<br />in the everyday.</div>
         <p className="nav-caption">YOUR SPACE</p>
@@ -707,8 +730,8 @@ export default function App() {
 
       <main className="main-content">
         <header className="topbar">
-          <div className="breadcrumb"><span>Wayfarer</span><span className="crumb-separator">/</span><strong>{title[screen]}</strong></div>
-          <span className={`network-status ${online ? "" : "offline"}`}><span className="status-dot" />{online ? "Local-first" : "Offline"}</span>
+          <div className="breadcrumb"><span>Daymark</span><span className="crumb-separator">/</span><strong>{title[screen]}</strong></div>
+          <div className="topbar-actions"><button className="theme-toggle" type="button" onClick={() => setTheme((value) => value === "light" ? "dark" : "light")} aria-label={`Switch to ${theme === "light" ? "dark" : "light"} mode`} title={`Switch to ${theme === "light" ? "dark" : "light"} mode`}><Icon name={theme === "light" ? "moon" : "sun"} size={17} /><span>{theme === "light" ? "Dark" : "Light"}</span></button><span className={`network-status ${online ? "" : "offline"}`}><span className="status-dot" />{online ? "Local-first" : "Offline"}</span></div>
         </header>
         {storageError && <div className="notice notice-error" role="alert">{storageError}</div>}
         <div className="page-area">
@@ -1190,14 +1213,6 @@ function Home({
             <button type="button" className="button button-quiet button-full" onClick={() => { void searchTypedArea(); }} disabled={nearbyLoading || !typedLocality.trim()}>
               {nearbyLoading ? "Searching…" : "Search typed area without GPS"}
             </button>
-            <button
-              type="button"
-              className="text-link manual-location-toggle"
-              aria-expanded={showManualLocation}
-              onClick={() => setShowManualLocation((shown) => !shown)}
-            >
-              {showManualLocation ? "Hide manual map location" : "Set my location manually (no GPS)"}
-            </button>
             {showManualLocation && (
               <div className="manual-location-panel">
                 <strong>Choose your location on OpenStreetMap</strong>
@@ -1283,6 +1298,16 @@ function Home({
               </>
             )}
           </div>
+          <button
+            type="button"
+            className="manual-location-launch"
+            aria-expanded={showManualLocation}
+            onClick={() => setShowManualLocation((shown) => !shown)}
+          >
+            <span className="manual-location-glyph"><Icon name="pin" size={18} /></span>
+            <span><strong>{showManualLocation ? "Close manual location" : "Enter location details manually"}</strong><small>Use a map link or coordinates · no GPS needed</small></span>
+            <Icon name={showManualLocation ? "back" : "arrow"} size={17} />
+          </button>
           <div className="field-pair">
             <label className="field-label">When? <span className="required-mark">*</span>
               <div className="input-with-icon"><Icon name="clock" size={17} /><input required value={timing} onChange={(event) => setTiming(event.target.value)} placeholder="Today, after 4" /></div>
@@ -1395,6 +1420,7 @@ function Outing({
   const [chatStatus, setChatStatus] = useState("");
   const [turnPending, setTurnPending] = useState(false);
   const [chatMessages, setChatMessages] = useState<OutingChatMessage[]>(draft.conversation ?? []);
+  const conversationLogRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<BrowserRecognition | null>(null);
   const voiceModeRef = useRef(false);
   const processingVoiceRef = useRef(false);
@@ -1407,6 +1433,11 @@ function Outing({
     voiceModeRef.current = false;
     recognitionRef.current?.stop();
   }, []);
+
+  useEffect(() => {
+    const log = conversationLogRef.current;
+    if (log) log.scrollTo({ top: log.scrollHeight, behavior: "smooth" });
+  }, [chatMessages]);
 
   function setMessages(messages: OutingChatMessage[]) {
     chatMessagesRef.current = messages;
@@ -1584,10 +1615,12 @@ function Outing({
     setMomentInput("");
   }
 
+  const latestUserMessage = [...chatMessages].reverse().find((message) => message.role === "user");
+
   return (
     <div className="outing-view">
       <div className="outing-top"><span className={`live-pill ${paused ? "paused" : ""}`}><span className="status-dot" />{paused ? "PAUSED" : "OUTING IN PROGRESS"}</span><button type="button" className="text-link" onClick={stopCamera}>End camera</button></div>
-      <div className="outing-heading"><p className="eyebrow">{plan.locality.toUpperCase()} · {plan.timing.toUpperCase()}</p><h1>{paused ? "Take all the time you need." : "Look up. I’m right here."}</h1><p className="lead">{paused ? "Your outing is paused. Nothing is being recorded." : `I’m here while you explore ${plan.place.name}. The best part is the part you notice.`}</p></div>
+      <div className="outing-heading"><p className="eyebrow">{plan.locality.toUpperCase()} · {plan.timing.toUpperCase()}</p><h1>{paused ? "Take all the time you need." : "A little space for the moment."}</h1><p className="lead">{paused ? "Your outing is paused. Nothing is being recorded." : `You're at ${plan.place.name}. Share a thought when it comes; your companion is here to listen.`}</p></div>
       <div className="media-grid">
         <section className="media-card camera-card">
           <div className="media-card-heading"><span className="media-icon"><Icon name="camera" /></span><div><strong>Your surroundings</strong><span>{cameraStatus === "active" ? "Camera is on · preview stays on this device" : cameraStatus === "paused" ? "Camera paused" : "Camera is off"}</span></div><span className={`media-indicator ${cameraStatus === "active" ? "media-indicator-on" : ""}`} /></div>
@@ -1605,16 +1638,23 @@ function Outing({
           <div className="camera-upload"><label className="text-link upload-label">Attach a photo to this diary entry<input type="file" accept="image/*" onChange={(event) => { const file = event.target.files?.[0]; if (file) void attachPhoto(file); }} /></label>{capturedImage && <button className="text-link" onClick={forgetPhoto}>Forget image</button>}</div>
         </section>
 
-        <section className="media-card voice-card">
-          <div className="media-card-heading"><span className="media-icon"><Icon name="heart" /></span><div><strong>A little conversation</strong><span>{voiceMode ? "Voice chat is on · Gemma replies locally" : "Talk or type · Gemma replies locally"}</span></div><span className={`media-indicator ${voiceMode ? "media-indicator-on" : ""}`} /></div>
-          <div className="companion-message"><div className="companion-avatar">w.</div><div><p>{chatMessages.length ? "I’m following along. What else is on your mind?" : "We made it here. What’s caught your eye so far?"}</p><span>YOUR COMPANION</span></div></div>
-          {chatMessages.length > 0 && <div className="conversation-log" aria-live="polite">{chatMessages.slice(-6).map((message, index) => <div className={`conversation-line ${message.role === "user" ? "conversation-user" : "conversation-ai"}`} key={`${index}-${message.content.slice(0, 24)}`}><span>{message.role === "user" ? "YOU" : "GEMMA"}</span><p>{message.content}</p></div>)}</div>}
-          <label className="field-label">A thought to share<textarea value={chatInput} disabled={paused || processingVoiceRef.current} onChange={(event) => setChatInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && chatInput.trim()) { event.preventDefault(); void sendToCompanion(chatInput); } }} placeholder="Talk to me about what’s on your mind…" rows={2} /></label>
-          <div className="voice-actions"><button type="button" className="button button-primary button-small" disabled={!chatInput.trim() || paused || processingVoiceRef.current} onClick={() => { void sendToCompanion(chatInput); }}>Send to Gemma <Icon name="arrow" size={15} /></button><button className="button button-secondary button-small" disabled={!draft.notes.trim() || paused || !elevenLabsConfigured} onClick={() => { stopVoiceConversation(); void onSpeak(draft.notes); }}><span aria-hidden="true">◖)))</span> Read my note aloud</button></div>
-          <label className="speech-consent"><input type="checkbox" checked={voiceConsent} disabled={voiceMode} onChange={(event) => setVoiceConsent(event.target.checked)} /><span>I understand my browser may send microphone audio to its speech-recognition provider. Transcribed words go to Gemma locally; spoken AI replies are sent to ElevenLabs.</span></label>
-          <div className="voice-actions voice-session-actions">{voiceMode ? <button type="button" className="button button-secondary button-small" onClick={stopVoiceConversation}>Stop listening</button> : <button type="button" className="button button-secondary button-small" disabled={paused} onClick={startVoiceConversation}><span aria-hidden="true">🎙</span> Start voice chat</button>}<span>{elevenLabsConfigured ? "ElevenLabs voice: narrative and friendly." : "Voice is set up after the server gets an ElevenLabs API key and voice ID."}</span></div>
+        <section className="media-card voice-card" aria-label="Outing conversation with Daymark">
+          <div className="media-card-heading"><span className="media-icon"><DaymarkMark size={34} /></span><div><strong>Your companion</strong><span>{voiceMode ? "Listening with you · responses spoken aloud" : "A private conversation for the moment"}</span></div><span className={`media-indicator ${voiceMode ? "media-indicator-on" : ""}`} /></div>
+          <div className="conversation-welcome"><span className="companion-avatar">d.</span><div><p>{chatMessages.length ? "I'm with you. What else would you like to remember?" : "No need to find the perfect words. What feels present right now?"}</p><span>DAYMARK · HERE WITH YOU</span></div></div>
+          <label className="speech-consent"><input type="checkbox" checked={voiceConsent} disabled={voiceMode} onChange={(event) => setVoiceConsent(event.target.checked)} /><span>Voice privacy: your browser may send microphone audio to its speech-recognition provider. Transcripts go to Gemma on this device; spoken replies go to ElevenLabs.</span></label>
+          <div className={`voice-call-control ${voiceMode ? "voice-call-active" : ""}`}>
+            {voiceMode ? <button type="button" className="voice-call-button voice-call-stop" onClick={stopVoiceConversation}><span className="voice-call-icon"><span /></span><span><strong>End voice chat</strong><small>Tap when you're ready to finish</small></span></button> : <button type="button" className="voice-call-button" disabled={paused || !voiceConsent} onClick={startVoiceConversation}><span className="voice-call-icon"><Icon name="sun" size={21} /></span><span><strong>Start voice conversation</strong><small>{!voiceConsent ? "Read and accept the voice note above first" : "Daymark will listen and reply aloud"}</small></span><Icon name="arrow" size={18} /></button>}
+            <span className="voice-quality-note">{elevenLabsConfigured ? "Narrative, friendly ElevenLabs voice" : "Add ElevenLabs server settings for spoken replies"}</span>
+          </div>
           {chatStatus && <p className="voice-status" role="status" aria-live="polite">{chatStatus}</p>}
-          <label className="field-label">A feeling you’d like me to remember <span className="optional-label">OPTIONAL</span><input value={draft.mood} disabled={paused} onChange={(event) => onDraftChange({ ...draft, mood: event.target.value })} placeholder="Only if you want to share how you feel" /></label>
+          <div ref={conversationLogRef} className={`conversation-log ${chatMessages.length ? "conversation-log-active" : "conversation-log-empty"}`} role="log" aria-label="Conversation transcript" aria-live="polite" aria-relevant="additions text">
+            {chatMessages.length === 0 ? <div className="conversation-empty"><span>✳</span><p>Your conversation will appear here as you talk. You can keep the phone in your pocket between thoughts.</p></div> : chatMessages.map((message, index) => <div className={`conversation-line ${message.role === "user" ? "conversation-user" : "conversation-ai"}`} key={`${index}-${message.content.slice(0, 24)}`}><span>{message.role === "user" ? "YOU" : "DAYMARK"}</span><p>{message.content}</p></div>)}
+          </div>
+          <div className="conversation-composer">
+            <label className="field-label">Or type a thought<textarea value={chatInput} disabled={paused || processingVoiceRef.current} onChange={(event) => setChatInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && chatInput.trim()) { event.preventDefault(); void sendToCompanion(chatInput); } }} placeholder="Write it here if that's easier…" rows={2} /></label>
+            <div className="voice-actions"><button type="button" className="button button-primary" disabled={!chatInput.trim() || paused || processingVoiceRef.current} onClick={() => { void sendToCompanion(chatInput); }}>Share with Daymark <Icon name="arrow" size={15} /></button><button type="button" className="button button-secondary button-small" disabled={!latestUserMessage || paused || !elevenLabsConfigured} onClick={() => { stopVoiceConversation(); if (latestUserMessage) void onSpeak(latestUserMessage.content); }}><span aria-hidden="true">◖)))</span> Hear my last thought</button></div>
+          </div>
+          <label className="field-label mood-checkin">A feeling you'd like the diary to hold <span className="optional-label">OPTIONAL</span><input value={draft.mood} disabled={paused} onChange={(event) => onDraftChange({ ...draft, mood: event.target.value })} placeholder="Tired but hopeful, quietly curious…" /></label>
         </section>
       </div>
       <section className="moment-capture">
@@ -1718,11 +1758,11 @@ function WrapUp({
 function DiaryLibrary({ entries, onOpen, onCreate }: { entries: DiaryEntry[]; onOpen: (entry: DiaryEntry) => void; onCreate: () => void }) {
   return (
     <div className="diary-library">
-      <div className="diary-heading"><div><p className="eyebrow">THE LITTLE DAYS THAT ADD UP</p><h1>Your diary<span className="title-period">.</span></h1><p className="lead">A place to come back to wherever we’ve been.</p></div><div className="diary-flower" aria-hidden="true">✳</div></div>
+      <div className="diary-heading"><div><p className="eyebrow">DAYMARK · YOUR PERSONAL ALMANAC</p><h1>The pages of your days<span className="title-period">.</span></h1><p className="lead">Each outing leaves a page behind. Come back whenever you like.</p></div><div className="diary-flower" aria-hidden="true"><DaymarkMark size={69} /></div></div>
       {entries.length === 0 ? (
         <div className="empty-diary"><div className="empty-book"><Icon name="book" size={31} /></div><p className="eyebrow">A BLANK PAGE, FOR NOW</p><h2>Every little adventure has a first page.</h2><p>When we come back from our first outing, our story will be waiting here — written from the things you chose to share.</p><button className="button button-primary" onClick={onCreate}>Let’s plan a little day <Icon name="arrow" /></button></div>
       ) : (
-        <div className="diary-grid">{entries.map((entry, index) => <button key={entry.id} className={`diary-card diary-card-${index % 3}`} onClick={() => onOpen(entry)}><div className="diary-card-date">{new Date(entry.createdAt).toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric" })}<span className="diary-card-icon"><Icon name="book" size={17} /></span></div>{entry.photoDataUrl && <img className="diary-card-photo" src={entry.photoDataUrl} alt="" />}<h2>{entry.placeName}</h2><p className="diary-card-area"><Icon name="pin" size={14} /> {entry.locality}</p><p className="diary-card-excerpt">{entry.story.slice(0, 190)}{entry.story.length > 190 ? "…" : ""}</p>{entry.moments.length > 0 && <div className="diary-card-moment"><Icon name="heart" size={14} /><span>{entry.moments[0]}</span></div>}<span className="diary-card-open">Read our story <Icon name="arrow" size={15} /></span></button>)}</div>
+        <div className="diary-grid">{entries.map((entry, index) => <button key={entry.id} className={`diary-card diary-card-${index % 3}`} onClick={() => onOpen(entry)} aria-label={`Open diary page: ${entry.placeName}, ${new Date(entry.createdAt).toLocaleDateString()}`}><span className="diary-page-number">PAGE {String(entries.length - index).padStart(2, "0")}</span><div className="diary-card-date">{new Date(entry.createdAt).toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" })}<span className="diary-card-icon"><Icon name="book" size={17} /></span></div>{entry.photoDataUrl && <img className="diary-card-photo" src={entry.photoDataUrl} alt="" />}<h2>{entry.placeName}</h2><p className="diary-card-area"><Icon name="pin" size={14} /> {entry.locality}</p><p className="diary-card-excerpt">{entry.story.slice(0, 190)}{entry.story.length > 190 ? "…" : ""}</p>{entry.moments.length > 0 && <div className="diary-card-moment"><Icon name="heart" size={14} /><span>{entry.moments[0]}</span></div>}<span className="diary-card-open">Turn this page <Icon name="arrow" size={15} /></span></button>)}</div>
       )}
       <div className="library-footnote"><Icon name="lock" size={14} /><span>Saved in this browser. No account, no cloud sync.</span></div>
     </div>
@@ -1732,7 +1772,7 @@ function DiaryLibrary({ entries, onOpen, onCreate }: { entries: DiaryEntry[]; on
 function DiaryView({ entry, elevenLabsConfigured, onSpeak, onBack, onDelete }: { entry: DiaryEntry; elevenLabsConfigured: boolean; onSpeak: (text: string) => Promise<void>; onBack: () => void; onDelete: () => void }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   return (
-    <article className="diary-entry-view">
+    <article className="diary-entry-view diary-page">
       <button className="back-link" onClick={onBack}><Icon name="back" size={17} /> Back to your diary</button>
       <header className="entry-header"><p className="eyebrow">{new Date(entry.createdAt).toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" })} · {entry.locality.toUpperCase()}</p><h1>A day at {entry.placeName}<span className="title-period">.</span></h1><div className="entry-decoration"><span /><Icon name="heart" /><span /></div></header>
       {entry.photoDataUrl && <figure className="entry-photo"><img src={entry.photoDataUrl} alt="Photo attached to this diary entry" /><figcaption>Saved with this entry in this browser only.</figcaption></figure>}
