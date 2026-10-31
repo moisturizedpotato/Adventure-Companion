@@ -1,4 +1,3 @@
-import { ModelType, type MLCEngineInterface } from "@mlc-ai/web-llm";
 import {
   buildGemmaDiaryInput,
   sanitizeGemmaDiary,
@@ -6,13 +5,9 @@ import {
   type DiaryPlan,
 } from "./diary";
 
-export const GEMMA_MODEL_ID = "gemma-2-2b-it-q4f16_1-MLC";
-export const GEMMA_MODEL_SIZE = "1.49 GB";
-export const GEMMA_REQUIRED_GPU_MEMORY_MB = 1896;
-export const PHOTO_VISION_MODEL_ID = "Phi-3.5-vision-instruct-q4f16_1-MLC";
-export const PHOTO_VISION_MODEL_SIZE = "2.77 GB";
-export const PHOTO_VISION_REQUIRED_GPU_MEMORY_MB = 3953;
+export const GEMMA_MODEL_ID = "gemma4:latest";
 
+const OLLAMA_BASE_URL = "http://127.0.0.1:11434";
 const GEMMA_DIARY_SYSTEM_PROMPT = [
   "You write grounded reflections using only the facts and cues supplied in the user's message.",
   "Never invent or imply an object, place detail, action, event, or time reference. In particular, do not add a watch, route, destination, weather, prior day, or previous outing unless explicitly supplied.",
@@ -21,10 +16,6 @@ const GEMMA_DIARY_SYSTEM_PROMPT = [
   "If an interesting detail is not supported by the supplied cues, leave it out. Accuracy matters more than embellishment.",
 ].join(" ");
 
-const GEMMA_WASM_CDN_PREFIX =
-  "https://cdn.jsdelivr.net/gh/mlc-ai/binary-mlc-llm-libs@025bcaf3780fa8254f5e5efd3bfea0a5397248f4/web-llm-models";
-const DEFAULT_WASM_PREFIX =
-  "https://raw.githubusercontent.com/mlc-ai/binary-mlc-llm-libs/main/web-llm-models";
 const DIARY_CREATIVE_ANGLES = [
   "notice a small detail that quietly changes the day's meaning",
   "let the emotional impression emerge gradually rather than naming it first",
@@ -34,120 +25,202 @@ const DIARY_CREATIVE_ANGLES = [
   "notice a subtle contrast among the supplied moments",
 ];
 
-let engine: MLCEngineInterface | null = null;
-let enginePromise: Promise<MLCEngineInterface> | null = null;
+type OllamaMessage = {
+  role: "system" | "user" | "assistant";
+  content: string;
+  images?: string[];
+};
+
+type OllamaChatOptions = {
+  temperature?: number;
+  top_p?: number;
+  repeat_penalty?: number;
+  frequency_penalty?: number;
+  num_predict?: number;
+};
+
+let gemmaReady = false;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+async function responseError(response: Response): Promise<string> {
+  const body = await response.text();
+  if (!body) return `Ollama returned HTTP ${response.status}.`;
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (isRecord(parsed) && typeof parsed.error === "string") return parsed.error;
+  } catch {
+    return body.slice(0, 500);
+  }
+  return body.slice(0, 500);
+}
+
+async function checkOllama(): Promise<void> {
+  let response: Response;
+  try {
+    response = await fetch(`${OLLAMA_BASE_URL}/api/tags`);
+  } catch (error) {
+    throw new Error(
+      `Could not connect to Ollama at ${OLLAMA_BASE_URL}. Start Ollama and try again. ${
+        error instanceof Error ? error.message : ""
+      }`.trim(),
+    );
+  }
+  if (!response.ok) throw new Error(`Ollama is unavailable. ${await responseError(response)}`);
+}
 
 export async function checkGemmaCompatibility(): Promise<{ supported: boolean; reason: string }> {
-  if (!window.isSecureContext) {
-    return { supported: false, reason: "Gemma requires a secure context, such as localhost or HTTPS." };
-  }
-
-  const gpu = (navigator as Navigator & {
-    gpu?: { requestAdapter: () => Promise<{ features: { has: (feature: string) => boolean } } | null> };
-  }).gpu;
-  if (!gpu) return { supported: false, reason: "This browser does not expose WebGPU." };
-
   try {
-    const adapter = await gpu.requestAdapter();
-    if (!adapter) return { supported: false, reason: "No compatible WebGPU adapter was found." };
-    if (!adapter.features.has("shader-f16")) {
-      return { supported: false, reason: "This GPU does not support the shader-f16 feature required by this Gemma build." };
-    }
+    await checkOllama();
     return { supported: true, reason: "" };
   } catch (error) {
     return {
       supported: false,
-      reason: error instanceof Error ? `WebGPU check failed: ${error.message}` : "WebGPU could not be checked.",
+      reason: error instanceof Error ? error.message : "Ollama could not be checked.",
     };
   }
+}
+
+function pullProgress(event: unknown, onProgress: (progress: number, message: string) => void): void {
+  if (!isRecord(event)) return;
+  if (typeof event.error === "string") throw new Error(event.error);
+  const status = typeof event.status === "string" ? event.status : "Preparing Gemma 4 with Ollama…";
+  const total = typeof event.total === "number" ? event.total : 0;
+  const completed = typeof event.completed === "number" ? event.completed : 0;
+  const progress = total > 0 ? Math.max(0, Math.min(99, Math.round((completed / total) * 100))) : 0;
+  const message = total > 0
+    ? `${status} (${progress}%)`
+    : `${status}…`;
+  onProgress(progress, message);
+}
+
+async function pullGemma(onProgress: (progress: number, message: string) => void): Promise<void> {
+  let response: Response;
+  try {
+    response = await fetch(`${OLLAMA_BASE_URL}/api/pull`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: GEMMA_MODEL_ID, stream: true }),
+    });
+  } catch (error) {
+    throw new Error(
+      `Ollama could not download ${GEMMA_MODEL_ID}. ${
+        error instanceof Error ? error.message : "Check the Ollama connection and try again."
+      }`,
+    );
+  }
+  if (!response.ok) throw new Error(`Ollama could not download ${GEMMA_MODEL_ID}. ${await responseError(response)}`);
+  if (!response.body) throw new Error("Ollama did not provide download progress.");
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let pending = "";
+  let completed = false;
+  while (true) {
+    const { done, value } = await reader.read();
+    pending += decoder.decode(value, { stream: !done });
+    const lines = pending.split(/\r?\n/);
+    pending = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const event: unknown = JSON.parse(line);
+      pullProgress(event, onProgress);
+      if (isRecord(event) && event.status === "success") completed = true;
+    }
+    if (done) break;
+  }
+  if (pending.trim()) {
+    const event: unknown = JSON.parse(pending);
+    pullProgress(event, onProgress);
+    if (isRecord(event) && event.status === "success") completed = true;
+  }
+  if (!completed) throw new Error(`Ollama did not confirm that ${GEMMA_MODEL_ID} finished downloading.`);
 }
 
 export async function loadGemma(
   onProgress: (progress: number, message: string) => void,
 ): Promise<void> {
-  if (engine) return;
-  if (!enginePromise) {
-    enginePromise = (async () => {
-      onProgress(0, "Loading the local inference runtime…");
-      const { CreateMLCEngine, prebuiltAppConfig } = await import("@mlc-ai/web-llm");
-      const modelRecord = prebuiltAppConfig.model_list.find((model) => model.model_id === GEMMA_MODEL_ID);
-      if (!modelRecord || !modelRecord.model_lib.startsWith(DEFAULT_WASM_PREFIX)) {
-        throw new Error("The installed WebLLM package does not contain the expected Gemma runtime configuration.");
-      }
-      const appConfig = {
-        ...prebuiltAppConfig,
-        model_list: prebuiltAppConfig.model_list.map((model) =>
-          model.model_id === GEMMA_MODEL_ID
-            ? { ...model, model_lib: model.model_lib.replace(DEFAULT_WASM_PREFIX, GEMMA_WASM_CDN_PREFIX) }
-            : model,
-        ),
-      };
-      onProgress(0, "Fetching the Gemma runtime and checking local model files…");
-      return CreateMLCEngine(GEMMA_MODEL_ID, {
-        appConfig,
-        logLevel: "WARN",
-        initProgressCallback: ({ progress, text }) => {
-          onProgress(
-            Math.max(0, Math.min(100, Math.round(progress * 100))),
-            text || "Preparing Gemma on this device…",
-          );
-        },
-      });
-    })();
-  }
+  onProgress(0, "Checking for Gemma 4 in Ollama…");
 
+  let response: Response;
   try {
-    engine = await enginePromise;
+    response = await fetch(`${OLLAMA_BASE_URL}/api/tags`);
   } catch (error) {
-    enginePromise = null;
-    throw error;
+    throw new Error(`Could not check Ollama models. ${error instanceof Error ? error.message : ""}`.trim());
   }
+  if (!response.ok) throw new Error(`Could not check Ollama models. ${await responseError(response)}`);
+  const payload: unknown = await response.json();
+  const models = isRecord(payload) && Array.isArray(payload.models) ? payload.models : [];
+  const installed = models.some((model) =>
+    isRecord(model) && (model.name === GEMMA_MODEL_ID || model.model === GEMMA_MODEL_ID),
+  );
+  if (!installed) await pullGemma(onProgress);
+  gemmaReady = true;
+  onProgress(100, `Gemma 4 (${GEMMA_MODEL_ID}) is ready through Ollama.`);
 }
 
-async function loadPhotoVision(
-  onProgress: (message: string) => void,
-): Promise<MLCEngineInterface> {
-  const { CreateMLCEngine, prebuiltAppConfig } = await import("@mlc-ai/web-llm");
-  const model = prebuiltAppConfig.model_list.find((item) => item.model_id === PHOTO_VISION_MODEL_ID);
-  if (!model || model.model_type !== ModelType.VLM) {
-    throw new Error("The installed WebLLM package does not include the expected local vision model.");
+function imageDataUrlToBase64(dataUrl: string): string {
+  const separator = dataUrl.indexOf(",");
+  if (!dataUrl.startsWith("data:image/") || separator < 0 || !dataUrl.slice(separator + 1)) {
+    throw new Error("The attached photo could not be prepared for local Gemma 4 analysis.");
   }
-  const appConfig = {
-    ...prebuiltAppConfig,
-    model_list: prebuiltAppConfig.model_list.map((item) =>
-      item.model_id === PHOTO_VISION_MODEL_ID && item.model_lib.startsWith(DEFAULT_WASM_PREFIX)
-        ? { ...item, model_lib: item.model_lib.replace(DEFAULT_WASM_PREFIX, GEMMA_WASM_CDN_PREFIX) }
-        : item,
-    ),
-  };
-  onProgress("Loading the local photo model…");
-  return CreateMLCEngine(PHOTO_VISION_MODEL_ID, {
-    appConfig,
-    logLevel: "WARN",
-    initProgressCallback: ({ progress, text }) => {
-      onProgress(text || `Preparing the photo model on this device (${Math.round(progress * 100)}%)…`);
-    },
-  });
+  return dataUrl.slice(separator + 1);
+}
+
+async function chat(
+  messages: OllamaMessage[],
+  options: OllamaChatOptions,
+  imageDataUrl?: string,
+): Promise<string> {
+  if (!gemmaReady) throw new Error("Set up Gemma 4 through Ollama in Settings before using it.");
+  if (imageDataUrl) {
+    const lastMessage = messages[messages.length - 1];
+    if (!lastMessage || lastMessage.role !== "user") {
+      throw new Error("The photo could not be attached to a user message.");
+    }
+    lastMessage.images = [imageDataUrlToBase64(imageDataUrl)];
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: GEMMA_MODEL_ID,
+        messages,
+        stream: false,
+        think: false,
+        options,
+      }),
+    });
+  } catch (error) {
+    throw new Error(
+      `Could not reach the local Ollama service. ${error instanceof Error ? error.message : "Check that Ollama is running."}`,
+    );
+  }
+  if (!response.ok) throw new Error(`Ollama could not generate a response. ${await responseError(response)}`);
+  const payload: unknown = await response.json();
+  if (!isRecord(payload) || !isRecord(payload.message) || typeof payload.message.content !== "string") {
+    throw new Error("Ollama returned an invalid chat response.");
+  }
+  return payload.message.content;
 }
 
 async function describePhotoLocally(photoDataUrl: string, onProgress: (message: string) => void): Promise<string> {
-  onProgress("Analyzing the attached photo locally…");
-  const vision = await loadPhotoVision(onProgress);
-  engine = vision;
-  const result = await vision.chat.completions.create({
-    messages: [{
+  onProgress("Analyzing the attached photo locally with Gemma 4…");
+  const content = await chat(
+    [{
       role: "user",
-      content: [
-        { type: "text", text: "Describe only the clearly visible objects, setting, colors, and composition in this photo in one concise sentence. Do not infer identity, emotion, relationships, location, time, or events. If unclear, say so. This description will be used as optional detail in a personal diary." },
-        { type: "image_url", image_url: { url: photoDataUrl } },
-      ],
+      content: "Describe only the clearly visible objects, setting, colors, and composition in this photo in one concise sentence. Do not infer identity, emotion, relationships, location, time, or events. If unclear, say so. This description will be used as optional detail in a personal diary.",
     }],
-    temperature: 0.2,
-    max_tokens: 80,
-  });
-  const content = result.choices[0]?.message.content;
-  if (typeof content !== "string" || !content.trim()) {
-    throw new Error("The local photo model could not describe this image. You can try again without photo analysis.");
+    { temperature: 0.2, num_predict: 80 },
+    photoDataUrl,
+  );
+  if (!content.trim()) {
+    throw new Error("Gemma 4 could not describe this image. You can try again without photo analysis.");
   }
   return content.trim().slice(0, 500);
 }
@@ -157,24 +230,14 @@ export async function writeGemmaDiary(
   draft: DiaryDraft,
   options: { analyzePhoto?: boolean; onProgress?: (message: string) => void } = {},
 ): Promise<string> {
-  if (!engine) throw new Error("Load Gemma on this device before writing with it.");
+  if (!gemmaReady) throw new Error("Load Gemma 4 through Ollama before writing with it.");
   let photoObservation = "";
   if (draft.photoDataUrl && options.analyzePhoto) {
-    options.onProgress?.("Switching from Gemma to the local photo model…");
-    await unloadGemma();
-    try {
-      photoObservation = await describePhotoLocally(draft.photoDataUrl, options.onProgress ?? (() => undefined));
-    } finally {
-      if (engine) {
-        await engine.unload();
-        engine = null;
-        enginePromise = null;
-      }
-      options.onProgress?.("Reloading Gemma to write your diary…");
-      await loadGemma((_, message) => options.onProgress?.(message || "Reloading Gemma to write your diary…"));
-    }
+    photoObservation = await describePhotoLocally(
+      draft.photoDataUrl,
+      options.onProgress ?? (() => undefined),
+    );
   }
-  if (!engine) throw new Error("Gemma could not be restored after photo analysis.");
   const creativeAngle = DIARY_CREATIVE_ANGLES[Math.floor(Math.random() * DIARY_CREATIVE_ANGLES.length)];
   const conversationLog = (draft.conversation ?? [])
     .filter(({ content }) => content.trim())
@@ -187,20 +250,21 @@ export async function writeGemmaDiary(
   );
   const conversationTranscript = await conversationFile.text();
   const { prompt } = buildGemmaDiaryInput(plan, draft, photoObservation, creativeAngle, conversationTranscript);
-  const result = await engine.chat.completions.create({
-    messages: [
+  const content = await chat(
+    [
       { role: "system", content: GEMMA_DIARY_SYSTEM_PROMPT },
       { role: "user", content: prompt },
     ],
-    temperature: 0.4,
-    top_p: 0.82,
-    repetition_penalty: 1.1,
-    frequency_penalty: 0.12,
-    max_tokens: 200,
-  });
-  const content = result.choices[0]?.message.content;
-  if (typeof content !== "string" || content.trim().length < 60) {
-    throw new Error("Gemma returned an incomplete diary draft. Try generating it again or use the local draft.");
+    {
+      temperature: 0.4,
+      top_p: 0.82,
+      repeat_penalty: 1.1,
+      frequency_penalty: 0.12,
+      num_predict: 200,
+    },
+  );
+  if (content.trim().length < 60) {
+    throw new Error("Gemma 4 returned an incomplete diary draft. Try generating it again or use the local draft.");
   }
 
   const cleaned = content
@@ -209,7 +273,7 @@ export async function writeGemmaDiary(
     .trim();
   const story = sanitizeGemmaDiary(cleaned, plan, draft);
   if (story.length < 60 || story.length > 5000) {
-    throw new Error("Gemma’s draft did not pass the diary length check. Try again or use the local draft.");
+    throw new Error("Gemma 4’s draft did not pass the diary length check. Try again or use the local draft.");
   }
   return story;
 }
@@ -220,23 +284,21 @@ export async function rankNearbyPlacesWithGemma(
   mood: string,
   places: Array<{ id: string; name: string; category?: string; details: string }>,
 ): Promise<Array<{ id: string; reason: string }>> {
-  if (!engine) throw new Error("Set up Gemma in Settings to match nearby places to your mood.");
+  if (!gemmaReady) throw new Error("Set up Gemma 4 in Settings to match nearby places to your mood.");
   const candidates = places.slice(0, 30).map(({ id, name, category, details }) => ({
     id, name, category: category ?? "mapped place", mappedDetails: details.slice(0, 240),
   }));
-  const result = await engine.chat.completions.create({
-    messages: [
+  const content = await chat(
+    [
       { role: "system", content: "You match nearby places to the user's stated mood. Use only these candidate places and their supplied map categories. Do not invent amenities, hours, access, safety, atmosphere, or distance comparisons. Return JSON only: an array of up to 8 objects with id and a brief, tentative reason grounded in the mood and supplied category. Never repeat private diary details in the reason; keep it discreet." },
       { role: "user", content: JSON.stringify({ mood: mood.slice(0, 1000), candidates }) },
     ],
-    temperature: 0.55,
-    max_tokens: 320,
-  });
-  const content = result.choices[0]?.message.content;
-  if (typeof content !== "string") throw new Error("Gemma did not return place matches.");
+    { temperature: 0.55, num_predict: 320 },
+  );
+  if (!content) throw new Error("Gemma 4 did not return place matches.");
   const cleaned = content.replace(/^\s*```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
   const parsed: unknown = JSON.parse(cleaned);
-  if (!Array.isArray(parsed)) throw new Error("Gemma returned an invalid place ranking.");
+  if (!Array.isArray(parsed)) throw new Error("Gemma 4 returned an invalid place ranking.");
   const validIds = new Set(candidates.map((place) => place.id));
   const seen = new Set<string>();
   return parsed.flatMap((item) => {
@@ -252,13 +314,13 @@ export async function replyWithGemma(
   messages: OutingChatMessage[],
   context: { place: string; locality: string },
 ): Promise<string> {
-  if (!engine) throw new Error("Set up Gemma in Settings before starting a conversation with the local AI companion.");
-  const recentMessages = messages.slice(-8).map((message) => ({
+  if (!gemmaReady) throw new Error("Set up Gemma 4 in Settings before starting a conversation with the local AI companion.");
+  const recentMessages: OllamaMessage[] = messages.slice(-8).map((message) => ({
     role: message.role,
     content: message.content.slice(0, 1200),
   }));
-  const result = await engine.chat.completions.create({
-    messages: [
+  const content = await chat(
+    [
       {
         role: "system",
         content: "You are Daymark, a thoughtful, friendly conversation buddy accompanying someone on an outing. Respond naturally to what they just said, with warmth and interest, and ask at most one gentle follow-up question when it fits. Be candid, emotionally perceptive, and never pretend to see, hear, or know details the user did not share. Do not diagnose, overpraise, or turn every response into advice. Vary your phrasing. Keep spoken-friendly replies to one or two concise sentences. The place and locality are context only; never invent sensory details about them.",
@@ -266,32 +328,29 @@ export async function replyWithGemma(
       { role: "user", content: `Outing context (not a claim about what the user experienced): ${context.place}, ${context.locality}.` },
       ...recentMessages,
     ],
-    temperature: 0.75,
-    top_p: 0.9,
-    repetition_penalty: 1.12,
-    max_tokens: 110,
-  });
-  const content = result.choices[0]?.message.content;
-  if (typeof content !== "string" || !content.trim()) throw new Error("Gemma did not return a reply. Please try again.");
+    {
+      temperature: 0.75,
+      top_p: 0.9,
+      repeat_penalty: 1.12,
+      num_predict: 110,
+    },
+  );
+  if (!content.trim()) throw new Error("Gemma 4 did not return a reply. Please try again.");
   return content.trim().replace(/^\s*["'“”]+|["'“”]+\s*$/g, "").slice(0, 900);
 }
 
-export async function forgetGemma(): Promise<void> {
-  if (engine) {
-    await engine.unload();
-    engine = null;
-    enginePromise = null;
-  }
-  const { deleteModelAllInfoInCache } = await import("@mlc-ai/web-llm");
-  await Promise.all([
-    deleteModelAllInfoInCache(GEMMA_MODEL_ID),
-    deleteModelAllInfoInCache(PHOTO_VISION_MODEL_ID),
-  ]);
-}
-
 export async function unloadGemma(): Promise<void> {
-  if (!engine) return;
-  await engine.unload();
-  engine = null;
-  enginePromise = null;
+  if (!gemmaReady) return;
+  let response: Response;
+  try {
+    response = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: GEMMA_MODEL_ID, prompt: "", keep_alive: 0, stream: false }),
+    });
+  } catch (error) {
+    throw new Error(`Could not unload Gemma 4 from Ollama memory. ${error instanceof Error ? error.message : ""}`.trim());
+  }
+  if (!response.ok) throw new Error(`Could not unload Gemma 4 from Ollama memory. ${await responseError(response)}`);
+  gemmaReady = false;
 }

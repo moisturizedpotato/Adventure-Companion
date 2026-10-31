@@ -3,13 +3,10 @@ import { hashText, makeDiary, type DiaryDraft, type DiaryPlan } from "./diary";
 import { parseMapCoordinates } from "./mapCoordinates.mjs";
 import {
   checkGemmaCompatibility,
-  forgetGemma,
-  GEMMA_MODEL_SIZE,
+  GEMMA_MODEL_ID,
   loadGemma,
   unloadGemma,
   writeGemmaDiary,
-  PHOTO_VISION_MODEL_SIZE,
-  PHOTO_VISION_REQUIRED_GPU_MEMORY_MB,
   replyWithGemma,
   rankNearbyPlacesWithGemma,
   type OutingChatMessage,
@@ -423,7 +420,7 @@ export default function App() {
   const [elevenLabsConfigured, setElevenLabsConfigured] = useState(false);
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const [gemmaStatus, setGemmaStatus] = useState<GemmaStatus>({ phase: "checking", message: "Checking this browser for local Gemma support…", progress: 0 });
+  const [gemmaStatus, setGemmaStatus] = useState<GemmaStatus>({ phase: "checking", message: "Checking for the local Ollama service…", progress: 0 });
   const [toast, setToast] = useState("");
 
   useEffect(() => {
@@ -433,35 +430,30 @@ export default function App() {
   }, [theme]);
 
   async function setupGemma() {
-    const compatibility = await checkGemmaCompatibility();
-    if (!compatibility.supported) {
-      setGemmaStatus({ phase: "unsupported", message: compatibility.reason, progress: 0 });
-      return;
-    }
-    setGemmaStatus({ phase: "loading", message: "Loading the local inference runtime…", progress: 0 });
+    setGemmaStatus({ phase: "loading", message: "Connecting to Ollama…", progress: 0 });
     try {
       await loadGemma((progress, message) => {
-        setGemmaStatus({ phase: "loading", message: message || "Preparing Gemma on this device…", progress });
+        setGemmaStatus({ phase: "loading", message: message || "Preparing Gemma 4 with Ollama…", progress });
       });
-      setGemmaStatus({ phase: "ready", message: "Gemma is loaded on this device. Diary prompts run locally.", progress: 100 });
+      setGemmaStatus({ phase: "ready", message: "Gemma 4 is ready through Ollama. Prompts run on this device.", progress: 100 });
     } catch (error) {
       setGemmaStatus({
         phase: "error",
-        message: `Gemma could not be loaded. Check available GPU memory and model storage, then retry. ${error instanceof Error ? error.message : "Unknown runtime error."}`,
+        message: `Gemma 4 could not be prepared. ${error instanceof Error ? error.message : "Check Ollama and try again."}`,
         progress: 0,
       });
     }
   }
 
   async function removeGemma() {
-    setGemmaStatus({ phase: "forgetting", message: "Unloading Gemma and removing its cached model files…", progress: 0 });
+    setGemmaStatus({ phase: "forgetting", message: "Unloading Gemma 4 from Ollama memory…", progress: 0 });
     try {
-      await forgetGemma();
-      setGemmaStatus({ phase: "available", message: "Gemma and the cached photo model were removed from this browser.", progress: 0 });
+      await unloadGemma();
+      setGemmaStatus({ phase: "available", message: "Gemma 4 was unloaded from memory. Its model files remain managed by Ollama.", progress: 0 });
     } catch (error) {
       setGemmaStatus({
         phase: "error",
-        message: `Gemma could not be fully removed from browser storage. ${error instanceof Error ? error.message : "Unknown storage error."}`,
+        message: `Gemma 4 could not be unloaded from Ollama memory. ${error instanceof Error ? error.message : "Unknown Ollama error."}`,
         progress: 0,
       });
     }
@@ -481,12 +473,12 @@ export default function App() {
           options.onProgress?.(message);
         },
       });
-      setGemmaStatus({ phase: "ready", message: "Gemma is loaded on this device. Diary prompts run locally.", progress: 100 });
+      setGemmaStatus({ phase: "ready", message: "Gemma 4 is ready through Ollama. Prompts run on this device.", progress: 100 });
       return story;
     } catch (error) {
       setGemmaStatus({
         phase: "error",
-        message: `Local diary generation failed. ${error instanceof Error ? error.message : "Try loading Gemma again."}`,
+        message: `Local diary generation failed. ${error instanceof Error ? error.message : "Try setting up Gemma 4 again."}`,
         progress: 0,
       });
       throw error;
@@ -504,7 +496,7 @@ export default function App() {
       }
       if (active) setGemmaStatus({
         phase: "available",
-        message: "WebGPU is available. Gemma is loaded only when you choose to set it up; any cached model files will be reused.",
+        message: "Ollama is available. Gemma 4 will be downloaded if needed when you choose to set it up.",
         progress: 0,
       });
     })();
@@ -670,7 +662,7 @@ export default function App() {
     void unloadGemma().catch((error: unknown) => {
       setGemmaStatus({
         phase: "error",
-        message: `Your diary data was deleted, but Gemma could not be unloaded from GPU memory. ${error instanceof Error ? error.message : "Unknown runtime error."}`,
+        message: `Your diary data was deleted, but Gemma 4 could not be unloaded from Ollama memory. ${error instanceof Error ? error.message : "Unknown Ollama error."}`,
         progress: 0,
       });
     });
@@ -1727,8 +1719,8 @@ function WrapUp({
           <button type="button" className="button button-secondary" disabled={generating} onClick={() => { void generateStory(); }}>
             {generating ? "Writing on this device…" : generatedStory ? "Try another version" : "Write with Gemma"}
           </button>
-          {draft.photoDataUrl && <label className="photo-analysis-choice"><input type="checkbox" checked={analyzePhoto} disabled={generating} onChange={(event) => setAnalyzePhoto(event.target.checked)} /><span><strong>Let the local AI look at this photo</strong><small>Optional. Downloads an additional {PHOTO_VISION_MODEL_SIZE} vision model and needs about {PHOTO_VISION_REQUIRED_GPU_MEMORY_MB} MB of GPU memory. The model runs on this device; no image is uploaded.</small></span></label>}
-          {generating && <p className="gemma-generation-status" role="status">{generationStatus || "The first response can take a little while as the GPU warms up."} Your notes and image stay on this device.</p>}
+          {draft.photoDataUrl && <label className="photo-analysis-choice"><input type="checkbox" checked={analyzePhoto} disabled={generating} onChange={(event) => setAnalyzePhoto(event.target.checked)} /><span><strong>Let the local AI look at this photo</strong><small>Optional. Gemma 4 analyzes the photo through Ollama on this device; it is not sent to a hosted AI service.</small></span></label>}
+          {generating && <p className="gemma-generation-status" role="status">{generationStatus || "Gemma 4 is writing locally through Ollama…"} Your notes and image stay on this device.</p>}
           {generationError && <p className="form-error" role="alert">{generationError}</p>}
         </section>
       ) : (
@@ -1749,7 +1741,7 @@ function WrapUp({
           </div>
           <button className="button button-primary button-full" disabled={generating} onClick={() => onSave(draft, generatedStory || undefined)}>Save this little story <Icon name="arrow" /></button>
         </div>
-        <aside className="diary-preview-card"><div className="preview-label"><Icon name="book" size={16} /> A FIRST LOOK AT OUR DIARY</div><h2>A day at {plan.place.name}</h2><p className="preview-date">{new Date().toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })} <span>·</span> {plan.locality}</p><div className="preview-rule" />{draft.photoDataUrl && <img className="diary-preview-photo" src={draft.photoDataUrl} alt="Photo attached to this diary entry" />}<p className="preview-story">{preview.story}</p><span className="preview-note">{generatedStory ? `Written by Gemma 2 2B locally from compact fact cues${analyzePhoto && draft.photoDataUrl ? " and optional on-device photo observations" : ""}; notes and photos stay on this device.` : "Local fallback; no LLM. It uses only the notes and moments you provided."}</span></aside>
+        <aside className="diary-preview-card"><div className="preview-label"><Icon name="book" size={16} /> A FIRST LOOK AT OUR DIARY</div><h2>A day at {plan.place.name}</h2><p className="preview-date">{new Date().toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })} <span>·</span> {plan.locality}</p><div className="preview-rule" />{draft.photoDataUrl && <img className="diary-preview-photo" src={draft.photoDataUrl} alt="Photo attached to this diary entry" />}<p className="preview-story">{preview.story}</p><span className="preview-note">{generatedStory ? `Written by Gemma 4 locally from compact fact cues${analyzePhoto && draft.photoDataUrl ? " and optional on-device photo observations" : ""}; notes and photos stay on this device.` : "Local fallback; no LLM. It uses only the notes and moments you provided."}</span></aside>
       </div>
     </div>
   );
@@ -1799,9 +1791,9 @@ function GemmaModelCard({
   onForget: () => Promise<void>;
 }) {
   const [acceptedTerms, setAcceptedTerms] = useState(false);
-  const canLoad = status.phase === "available" || status.phase === "error";
+  const canLoad = status.phase === "available" || status.phase === "unsupported" || status.phase === "error";
   const busy = status.phase === "checking" || status.phase === "loading" || status.phase === "forgetting";
-  const hasModelFiles = status.phase === "ready" || status.phase === "error";
+  const canUnload = status.phase === "ready";
   const [actionError, setActionError] = useState("");
 
   async function runAction(action: () => Promise<void>) {
@@ -1818,8 +1810,8 @@ function GemmaModelCard({
       <div className="settings-card-title">
         <div className="settings-icon"><Icon name="sun" /></div>
         <div>
-          <h2 id="gemma-title">On-device diary model: Gemma 2 2B</h2>
-          <p>Open-weight, instruction-tuned Gemma runs in this browser through WebGPU. The model is quantized to 4-bit for local inference; setup downloads about {GEMMA_MODEL_SIZE} of model files and compiled runtime assets. The model needs a compatible WebGPU adapter with shader-f16 and approximately 1.9 GB of GPU memory.</p>
+          <h2 id="gemma-title">On-device diary model: Gemma 4</h2>
+          <p>Gemma 4 runs locally through Ollama ({GEMMA_MODEL_ID}). Setup downloads the model through Ollama if it is not already installed; model storage and memory requirements depend on Ollama and your device. Update Ollama if it does not recognize Gemma 4.</p>
         </div>
       </div>
       <div className={`gemma-status gemma-status-${status.phase}`} role="status" aria-live="polite">
@@ -1827,7 +1819,7 @@ function GemmaModelCard({
         <span>{status.message}</span>
       </div>
       {status.phase === "loading" && <progress className="gemma-progress" max={100} value={status.progress} aria-label="Gemma model setup progress" />}
-      <p className="gemma-disclosure">For initial setup, model files are fetched from Hugging Face and the version-pinned WebGPU runtime from jsDelivr; those hosts receive ordinary network metadata, not your diary notes. After setup, diary prompts and generation stay in this browser. Browser storage can be evicted, and you can remove the downloaded model here.</p>
+      <p className="gemma-disclosure">Setup uses your local Ollama service at 127.0.0.1:11434 and downloads the model from Ollama’s model registry if needed. Diary prompts and optional photo analysis are sent only to that local Ollama service. Ollama manages the model files; unloading here frees model memory without deleting the download.</p>
       <label className="toggle-row gemma-terms">
         <input type="checkbox" checked={acceptedTerms} onChange={(event) => setAcceptedTerms(event.target.checked)} />
         <span className="custom-checkbox" />
@@ -1840,15 +1832,15 @@ function GemmaModelCard({
           disabled={!acceptedTerms || busy}
           onClick={() => { void runAction(onSetup); }}
         >
-          {status.phase === "ready" ? "Load Gemma on this device" : `Agree and prepare Gemma (up to ${GEMMA_MODEL_SIZE} if not cached)`}
+          {status.phase === "unsupported" ? "Check Ollama and set up Gemma 4" : status.phase === "error" ? "Retry Gemma 4 setup" : "Agree and set up Gemma 4 with Ollama"}
         </button>}
-        {hasModelFiles && <button
+        {canUnload && <button
           type="button"
           className="button button-quiet button-small"
           disabled={busy}
           onClick={() => { void runAction(onForget); }}
         >
-          Forget downloaded model
+          Unload Gemma from memory
         </button>}
       </div>
       {actionError && <p className="form-error" role="alert">{actionError}</p>}
@@ -1888,11 +1880,11 @@ function Settings({
     <div className="settings-layout">
       <div className="settings-heading"><p className="eyebrow">YOUR DEVICE, YOUR CHOICES</p><h1>Your space,<br /><em>your rules.</em></h1><p className="lead">A few notes on what stays here, and what this demo can do.</p></div>
       <GemmaModelCard status={gemmaStatus} onSetup={onSetupGemma} onForget={onForgetGemma} />
-      <section className="settings-card"><div className="settings-card-title"><div className="settings-icon"><Icon name="lock" /></div><div><h2>Your local data</h2><p>Stories, preferences, saved places, draft notes, and attached diary photos live in this browser’s local storage. Photos are resized and kept on this device; this app does not encrypt local data or upload photos. If you opt in to image analysis while writing, the attached image is processed locally and its short visual description is used by Gemma. Coordinates are not saved. When you request a nearby search, coordinates rounded to about 100 m and broad place categories go to the application server, which searches OpenStreetMap Overpass and may use Geoapify Places if Overpass fails or returns no places; the answering provider receives the approximate location and ordinary network metadata. Your full mood text stays in this browser for local Gemma ranking. Typed-area search also sends the area text to OpenStreetMap Nominatim to find an approximate centre. The application server does not store search coordinates.</p></div></div><div className="data-tally"><span>{data.entries.length} diary entr{data.entries.length === 1 ? "y" : "ies"}</span><span>{data.places.length} saved place{data.places.length === 1 ? "" : "s"}</span></div><button className="button button-secondary" onClick={exportWithError}><Icon name="download" size={17} /> Export my data</button>{exportError && <p className="form-error" role="alert">{exportError}</p>}</section>
-      <section className="settings-card"><div className="settings-card-title"><div className="settings-icon"><Icon name="sun" /></div><div><h2>Voice companion & speech</h2><p>Browser speech recognition transcribes only while you start voice chat and may send microphone audio to the browser vendor’s service. User speech is passed to local Gemma. If configured, the spoken reply and any diary entry you choose to read aloud are sent to ElevenLabs for voice generation. You choose when to start listening and when to read an entry.</p></div></div><div className="capability-list"><Capability label="Local Gemma conversation" detail="Voice chat requires the Gemma model to be set up and loaded in this browser." active={gemmaStatus.phase === "ready"} /><Capability label="ElevenLabs text-to-speech" detail={elevenLabsConfigured ? "Configured. Voice replies and diary read-aloud use your selected voice." : "Not configured. Set ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID on the server, then restart it."} active={elevenLabsConfigured} /><Capability label="On-demand browser speech recognition" detail="Available only in browsers with SpeechRecognition/WebKit SpeechRecognition and after you accept the disclosure and grant microphone permission." /></div></section>
-      <section className="settings-card"><div className="settings-card-title"><div className="settings-icon"><Icon name="camera" /></div><div><h2>Camera</h2><p>The browser asks before the camera is used; the preview is local and a photo is saved only when you choose to attach it to a diary entry. Photos are never uploaded; optional image analysis uses a separate local vision model only after you opt in on the diary screen.</p></div></div></section>
+      <section className="settings-card"><div className="settings-card-title"><div className="settings-icon"><Icon name="lock" /></div><div><h2>Your local data</h2><p>Stories, preferences, saved places, draft notes, and attached diary photos live in this browser’s local storage. Photos are resized and kept on this device; this app does not encrypt local data or send photos to hosted services. If you opt in to image analysis while writing, the image is sent to local Ollama and its short visual description is used by Gemma 4. Coordinates are not saved. When you request a nearby search, coordinates rounded to about 100 m and broad place categories go to the application server, which searches OpenStreetMap Overpass and may use Geoapify Places if Overpass fails or returns no places; the answering provider receives the approximate location and ordinary network metadata. Your full mood text stays in this browser for local Gemma ranking. Typed-area search also sends the area text to OpenStreetMap Nominatim to find an approximate centre. The application server does not store search coordinates.</p></div></div><div className="data-tally"><span>{data.entries.length} diary entr{data.entries.length === 1 ? "y" : "ies"}</span><span>{data.places.length} saved place{data.places.length === 1 ? "" : "s"}</span></div><button className="button button-secondary" onClick={exportWithError}><Icon name="download" size={17} /> Export my data</button>{exportError && <p className="form-error" role="alert">{exportError}</p>}</section>
+      <section className="settings-card"><div className="settings-card-title"><div className="settings-icon"><Icon name="sun" /></div><div><h2>Voice companion & speech</h2><p>Browser speech recognition transcribes only while you start voice chat and may send microphone audio to the browser vendor’s service. User speech is passed to local Gemma 4 through Ollama. If configured, the spoken reply and any diary entry you choose to read aloud are sent to ElevenLabs for voice generation. You choose when to start listening and when to read an entry.</p></div></div><div className="capability-list"><Capability label="Local Gemma conversation" detail="Voice chat requires Gemma 4 to be set up through Ollama." active={gemmaStatus.phase === "ready"} /><Capability label="ElevenLabs text-to-speech" detail={elevenLabsConfigured ? "Configured. Voice replies and diary read-aloud use your selected voice." : "Not configured. Set ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID on the server, then restart it."} active={elevenLabsConfigured} /><Capability label="On-demand browser speech recognition" detail="Available only in browsers with SpeechRecognition/WebKit SpeechRecognition and after you accept the disclosure and grant microphone permission." /></div></section>
+      <section className="settings-card"><div className="settings-card-title"><div className="settings-icon"><Icon name="camera" /></div><div><h2>Camera</h2><p>The browser asks before the camera is used; the preview is local and a photo is saved only when you choose to attach it to a diary entry. Photos are not sent to hosted services; optional image analysis sends a resized photo to local Ollama only after you opt in on the diary screen.</p></div></div></section>
       <section className="settings-card settings-delete"><div className="settings-card-title"><div className="settings-icon"><span>×</span></div><div><h2>Start fresh</h2><p>Delete your profile, places, notes, and every diary entry from this browser.</p></div></div>{!confirmDelete ? <button className="button button-danger-outline" onClick={() => setConfirmDelete(true)}>Delete all my data</button> : <div className="delete-confirm"><span>This can’t be undone.</span><button className="button button-danger" onClick={onDeleteAll}>Delete everything</button><button className="button button-quiet" onClick={() => setConfirmDelete(false)}>Keep my data</button></div>}</section>
-      <div className="settings-offline-note"><span className="status-dot status-dot-green" />The app shell is cached locally after your first visit. Diary writing and conversation use local Gemma. Optional speech recognition may use your browser’s provider, and requested speech uses ElevenLabs. GPS, manual map-point, and typed-area searches need a network connection and send location queries through the application server to OpenStreetMap, with Geoapify as an optional fallback.</div>
+      <div className="settings-offline-note"><span className="status-dot status-dot-green" />The app shell is cached locally after your first visit. Diary writing and conversation use local Gemma 4 through Ollama, which must be running. Optional speech recognition may use your browser’s provider, and requested speech uses ElevenLabs. GPS, manual map-point, and typed-area searches need a network connection and send location queries through the application server to OpenStreetMap, with Geoapify as an optional fallback.</div>
     </div>
   );
 }
